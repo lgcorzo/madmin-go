@@ -29,7 +29,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/lgcorzo/minio-go/v7/pkg/tags"
 )
 
 // AccountAccess contains information about

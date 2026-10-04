@@ -22,7 +22,7 @@ package madmin
 import (
 	"time"
 
-	"github.com/minio/minio-go/v7/pkg/replication"
+	"github.com/lgcorzo/minio-go/v7/pkg/replication"
 )
 
 type ReplDiagInfo struct {

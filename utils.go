@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go/v7/pkg/s3utils"
+	"github.com/lgcorzo/minio-go/v7/pkg/s3utils"
 )
 
 //msgp:clearomitted

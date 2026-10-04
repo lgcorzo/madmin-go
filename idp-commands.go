@@ -29,7 +29,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/lgcorzo/minio-go/v7/pkg/set"
 )
 
 // AddOrUpdateIDPConfig - creates a new or updates an existing IDP

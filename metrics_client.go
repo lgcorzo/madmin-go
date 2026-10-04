@@ -27,7 +27,7 @@ import (
 	"time"
 
 	jwtgo "github.com/golang-jwt/jwt/v4"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/lgcorzo/minio-go/v7/pkg/credentials"
 )
 
 const (
