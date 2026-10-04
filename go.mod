@@ -8,7 +8,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/golang-jwt/jwt/v4 v4.5.2
-	github.com/lgcorzo/minio-go/v7 v7.0.91
+	github.com/lgcorzo/minio-go/v7 v7.0.91-lgcorzo.2
 	github.com/prometheus/common v0.63.0
 	github.com/prometheus/procfs v0.16.0
 	github.com/prometheus/prom2json v1.4.2
@@ -31,8 +31,8 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/kr/pretty v0.2.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/lgcorzo/crc64nvme v1.0.1 // indirect
-	github.com/lgcorzo/md5-simd v1.1.2 // indirect
+	github.com/lgcorzo/crc64nvme v1.0.1-lgcorzo.1 // indirect
+	github.com/lgcorzo/md5-simd v1.1.2-lgcorzo.1 // indirect
 	github.com/lufia/plan9stats v0.0.0-20250317134145-8bc96cf8fc35 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
