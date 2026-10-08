@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // segmentStart is the wall-clock start of segment i of a window: segments are

@@ -22,7 +22,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // IAMMetricsNode is the navigation node for identity and access management.

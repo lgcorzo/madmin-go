@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 func targetWindow(segments ...madmin.TargetSegment) *madmin.SegmentedTargetMetrics {

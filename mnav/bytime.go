@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // byTimeName is the navigation key for the time-first ("_by_time") entry added

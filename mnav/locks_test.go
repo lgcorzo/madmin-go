@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 var lockFirstTime = time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)

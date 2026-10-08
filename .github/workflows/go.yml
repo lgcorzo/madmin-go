@@ -1,4 +1,4 @@
-name: Go
+name: Sovereign Go Build & Test
 
 on:
   pull_request:

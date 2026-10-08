@@ -1,4 +1,4 @@
-name: VulnCheck
+name: Sovereign VulnCheck
 on:
   pull_request:
     branches:

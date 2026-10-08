@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // dupFirstTime is the start of a 97-slot quarter-hour timeline, so slot 0 and slot

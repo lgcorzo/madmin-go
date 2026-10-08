@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // shortARN trims "arn:minio:replication::338f8fdd-16da-41da-82fb-c36acd2fef8a:bucket"

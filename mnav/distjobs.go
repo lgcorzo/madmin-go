@@ -25,7 +25,7 @@ import (
 	"strings"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // DistJobMetricsNode is the navigation node for distributed (server-pool) jobs.

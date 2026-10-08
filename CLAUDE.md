@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is the MinIO Admin Golang Client SDK (`github.com/minio/madmin-go/v4`), which provides APIs to manage MinIO services. It's a Go library that enables programmatic administration of MinIO object storage clusters.
+This is the MinIO Admin Golang Client SDK (`github.com/lgcorzo/madmin-go/v4`), which provides APIs to manage MinIO services. It's a Go library that enables programmatic administration of MinIO object storage clusters.
 
 ## Development Commands
 

@@ -23,7 +23,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // KMSMetricsNode represents the root KMS metrics node.

@@ -1,4 +1,4 @@
-name: Golangci-lint
+name: Sovereign Golangci-lint
 
 on:
   workflow_dispatch: # ability to manually run from the github actions UI

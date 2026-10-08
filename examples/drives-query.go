@@ -28,7 +28,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 

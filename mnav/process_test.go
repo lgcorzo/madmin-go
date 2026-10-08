@@ -22,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 // Every process value on the wire is a sum over the processes that reported, so

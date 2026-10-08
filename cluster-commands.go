@@ -442,12 +442,12 @@ type SRGroupInfo struct {
 type SRCredInfo struct {
 	AccessKey string `json:"accessKey"`
 
-	// This type corresponds to github.com/minio/minio/cmd.IAMUserType
+	// This type corresponds to github.com/lgcorzo/minio/cmd.IAMUserType
 	IAMUserType int `json:"iamUserType"`
 
 	IsDeleteReq bool `json:"isDeleteReq,omitempty"`
 
-	// This is the JSON encoded value of github.com/minio/minio/cmd.UserIdentity
+	// This is the JSON encoded value of github.com/lgcorzo/minio/cmd.UserIdentity
 	UserIdentityJSON json.RawMessage `json:"userIdentityJSON"`
 	APIVersion       string          `json:"apiVersion,omitempty"`
 }
