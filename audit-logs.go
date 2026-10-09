@@ -28,16 +28,29 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/minio/madmin-go/v4/log"
+	"github.com/lgcorzo/madmin-go/v4/log"
 	"github.com/tinylib/msgp/msgp"
 )
 
-// AuditLogOpts represents the options for the audit logs
+// AuditLogOpts represents the options for the audit logs.
+//
+// Wildcard syntax on Nodes / APIs / Buckets entries (case-insensitive):
+//
+//	"xyz"   → exact match
+//	"xyz*"  → prefix match
+//	"*xyz"  → suffix match
+//	"*xyz*" → contains match
+//	"*"     → matches anything
+//
+// Values within a single field OR-combine; across fields filters AND.
 type AuditLogOpts struct {
-	Node     string        `json:"node,omitempty"`
-	API      string        `json:"api,omitempty"`
-	Bucket   string        `json:"bucket,omitempty"`
-	Interval time.Duration `json:"interval,omitempty"`
+	Nodes      []string            `json:"nodes,omitempty"`
+	APIs       []string            `json:"apis,omitempty"`
+	Buckets    []string            `json:"buckets,omitempty"`
+	Interval   time.Duration       `json:"interval,omitempty"`
+	Categories []log.AuditCategory `json:"categories,omitempty"`
+	MaxPerNode int                 `json:"maxPerNode,omitempty"` // Deprecated: use Limit
+	Limit      int                 `json:"limit,omitempty"`
 }
 
 // GetAuditLogs fetches the persisted audit logs from MinIO
@@ -68,13 +81,18 @@ func (adm AdminClient) GetAuditLogs(ctx context.Context, opts AuditLogOpts) iter
 				if errors.Is(err, io.EOF) {
 					break
 				}
+				if !yield(log.Audit{}, err) {
+					return
+				}
 				continue
 			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				yield(info, nil)
+				if !yield(info, nil) {
+					return
+				}
 			}
 		}
 	}

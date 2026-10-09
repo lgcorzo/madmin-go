@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2015-2024 MinIO, Inc.
+// Copyright (c) 2015-2026 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -32,7 +32,7 @@ import (
 )
 
 //msgp:tag json
-//go:generate msgp -d clearomitted -d "timezone utc" -file $GOFILE
+//go:generate go tool msgp -d clearomitted -d "timezone utc" -file $GOFILE
 
 var (
 	// MinIO only supports last two versions
@@ -53,6 +53,10 @@ var (
 
 	// Admin API version prefix for previous version.
 	adminAPIOldPrefix = "/v3"
+
+	// filesAPIPrefix is the route group of the AIStor Files admin API, served at
+	// /minio/admin/files/v1 and versioned independently of the MinIO admin API.
+	filesAPIPrefix = "/files/v1"
 
 	// kmsAPIVersion - is the latest KMS API version, for KMS requests.
 	// NOTE: MinIO only supports last two versions
@@ -153,6 +157,13 @@ type TimedAction struct {
 	Bytes   uint64 `json:"bytes,omitempty"`
 }
 
+// Add other to t.
+func (t *TimedAction) Add(t2 *TimedAction) {
+	if t2 != nil {
+		t.Merge(*t2)
+	}
+}
+
 // Avg returns the average time spent on the action.
 func (t TimedAction) Avg() time.Duration {
 	if t.Count == 0 {
@@ -181,6 +192,42 @@ func (t *TimedAction) Merge(other TimedAction) {
 	t.AccTime += other.AccTime
 	t.Bytes += other.Bytes
 	t.MaxTime = max(t.MaxTime, other.MaxTime)
+}
+
+// KMSAction contains per-operation KMS call statistics.
+type KMSAction struct {
+	Count      uint64  `json:"n,omitempty"`
+	AccTime    float64 `json:"t,omitempty"`
+	MinTime    float64 `json:"min,omitempty"`
+	MaxTime    float64 `json:"max,omitempty"`
+	ConnFails  uint64  `json:"cf,omitempty"`
+	RemoteErrs uint64  `json:"re,omitempty"`
+}
+
+// Avg returns the average time spent on the action.
+func (t KMSAction) Avg() time.Duration {
+	if t.Count == 0 {
+		return 0
+	}
+	return time.Duration(t.AccTime * float64(time.Second) / float64(t.Count))
+}
+
+// Add other to t.
+func (t *KMSAction) Add(other *KMSAction) {
+	if other == nil {
+		return
+	}
+	if t.Count == 0 {
+		t.MinTime = other.MinTime
+	}
+	if other.Count > 0 {
+		t.MinTime = min(t.MinTime, other.MinTime)
+	}
+	t.Count += other.Count
+	t.AccTime += other.AccTime
+	t.MaxTime = max(t.MaxTime, other.MaxTime)
+	t.ConnFails += other.ConnFails
+	t.RemoteErrs += other.RemoteErrs
 }
 
 // DiskAction contains a number of actions and their accumulated duration in nanoseconds.

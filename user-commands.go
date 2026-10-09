@@ -38,15 +38,35 @@ type AccountAccess struct {
 	Write bool `json:"write"`
 }
 
+// BucketRetention holds the default object lock retention rule for a bucket.
+type BucketRetention struct {
+	Mode  string `json:"mode"`
+	Days  uint64 `json:"days,omitempty"`
+	Years uint64 `json:"years,omitempty"`
+}
+
 // BucketDetails provides information about features currently
 // turned-on per bucket.
 type BucketDetails struct {
-	Versioning          bool         `json:"versioning"`
-	VersioningSuspended bool         `json:"versioningSuspended"`
-	Locking             bool         `json:"locking"`
-	Replication         bool         `json:"replication"`
-	Tagging             *tags.Tags   `json:"tags"`
-	Quota               *BucketQuota `json:"quota"`
+	Versioning          bool             `json:"versioning"`
+	VersioningSuspended bool             `json:"versioningSuspended"`
+	Locking             bool             `json:"locking"`
+	Replication         bool             `json:"replication"`
+	Tagging             *tags.Tags       `json:"tags"`
+	Quota               *BucketQuota     `json:"quota"`
+	SSEType             string           `json:"sseType,omitempty"`
+	SSEKeyID            string           `json:"sseKeyID,omitempty"`
+	Retention           *BucketRetention `json:"retention,omitempty"`
+	QoSRules            int              `json:"qosRules,omitempty"`
+	Compression         bool             `json:"compression,omitempty"`
+	// CompressionILM reports that the bucket has at least one lifecycle rule
+	// carrying a compression action.
+	CompressionILM bool `json:"compressionILM,omitempty"`
+	// IsWarehouse reports that the bucket is an AIStor Tables warehouse.
+	// Warehouses are configured through the Tables API rather than the S3
+	// bucket-configuration APIs, so a caller listing buckets needs to tell them
+	// apart to know which configuration applies.
+	IsWarehouse bool `json:"isWarehouse,omitempty"`
 }
 
 // BucketAccessInfo represents bucket usage of a bucket, and its relevant
@@ -55,6 +75,8 @@ type BucketAccessInfo struct {
 	Name                    string            `json:"name"`
 	Size                    uint64            `json:"size"`
 	Objects                 uint64            `json:"objects"`
+	Versions                uint64            `json:"versions"`
+	DeleteMarkers           uint64            `json:"deleteMarkers"`
 	ObjectSizesHistogram    map[string]uint64 `json:"objectHistogram"`
 	ObjectVersionsHistogram map[string]uint64 `json:"objectsVersionsHistogram"`
 	Details                 *BucketDetails    `json:"details"`
@@ -332,6 +354,41 @@ func (adm *AdminClient) SetUserStatus(ctx context.Context, accessKey string, sta
 	return nil
 }
 
+// ChangeMyPassword - changes the password for the currently authenticated user.
+// This bypasses IAM policy checks entirely, allowing users to change their own
+// password even with explicit deny on admin:CreateUser.
+func (adm *AdminClient) ChangeMyPassword(ctx context.Context, newSecretKey string) error {
+	data, err := json.Marshal(AddOrUpdateUserReq{
+		SecretKey: newSecretKey,
+	})
+	if err != nil {
+		return err
+	}
+
+	encData, err := EncryptData(adm.getSecretKey(), data)
+	if err != nil {
+		return err
+	}
+
+	reqData := requestData{
+		relPath: adminAPIPrefix + "/change-my-password",
+		content: encData,
+	}
+
+	// Execute POST on /minio/admin/v3/change-my-password
+	resp, err := adm.executeMethod(ctx, http.MethodPost, reqData)
+	defer closeResponse(resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return httpRespToErrorResponse(resp)
+	}
+
+	return nil
+}
+
 // AddServiceAccountReq is the request options of the add service account admin call
 type AddServiceAccountReq struct {
 	Policy     json.RawMessage `json:"policy,omitempty"` // Parsed value from iam/policy.Parse()
@@ -345,6 +402,10 @@ type AddServiceAccountReq struct {
 	Description string `json:"description,omitempty"`
 	// Time at which this access key expires
 	Expiration *time.Time `json:"expiration,omitempty"`
+
+	// Optional and only relevant for LDAP. If empty, the default
+	// configuration is used.
+	ConfigName string `json:"configName,omitempty"`
 }
 
 var serviceAcctValidNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*`)
@@ -596,11 +657,15 @@ func (adm *AdminClient) ListServiceAccounts(ctx context.Context, user string) (L
 
 type ListAccessKeysResp struct {
 	ServiceAccounts []ServiceAccountInfo `json:"serviceAccounts"`
-	STSKeys         []ServiceAccountInfo `json:"stsKeys"`
+
+	// Deprecated: no longer populated by server
+	STSKeys []ServiceAccountInfo `json:"stsKeys"`
 }
 
 const (
-	AccessKeyListUsersOnly  = "users-only"
+	AccessKeyListUsersOnly = "users-only"
+
+	// Deprecated: STS listing is no longer supported server-side.
 	AccessKeyListSTSOnly    = "sts-only"
 	AccessKeyListSvcaccOnly = "svcacc-only"
 	AccessKeyListAll        = "all"
@@ -702,12 +767,39 @@ type OpenIDUserAccessKeys struct {
 	ID              string               `json:"ID"`
 	ReadableName    string               `json:"readableName"`
 	ServiceAccounts []ServiceAccountInfo `json:"serviceAccounts"`
-	STSKeys         []ServiceAccountInfo `json:"stsKeys"`
+
+	// Deprecated: no longer populated by server
+	STSKeys []ServiceAccountInfo `json:"stsKeys"`
 }
 
 type ListAccessKeysOpenIDResp struct {
 	ConfigName string                 `json:"configName"`
 	Users      []OpenIDUserAccessKeys `json:"users"`
+}
+
+// ListAccessKeysByProviderResp is the service-account listing grouped by provider.
+type ListAccessKeysByProviderResp struct {
+	Builtin []AccessKeysByConfig `json:"builtin"`
+	LDAP    []AccessKeysByConfig `json:"ldap"`
+	OpenID  []AccessKeysByConfig `json:"openid"`
+	Other   []AccessKeysByConfig `json:"other"`
+}
+
+// AccessKeysByConfig groups a provider's accounts by config name (empty for builtin and other).
+type AccessKeysByConfig struct {
+	Name  string             `json:"name,omitempty"`
+	Users []AccessKeysByUser `json:"users"`
+}
+
+// AccessKeysByUser groups a config's accounts by parent user. ID and
+// ReadableName carry provider-specific identity: for OpenID, ID is the
+// configured ID claim and ReadableName the readable claim; for LDAP, ID is the
+// decoded external DN. Both are empty for builtin accounts.
+type AccessKeysByUser struct {
+	ParentUser      string               `json:"parentUser"`
+	ID              string               `json:"id,omitempty"`
+	ReadableName    string               `json:"readableName,omitempty"`
+	ServiceAccounts []ServiceAccountInfo `json:"serviceAccounts"`
 }
 
 // ListAccessKeysOpenIDBulk - list access keys belonging to the given users or all users
@@ -757,15 +849,46 @@ func (adm *AdminClient) ListAccessKeysOpenIDBulk(ctx context.Context, users []st
 	return listResp, nil
 }
 
+// ListAccessKeysByProvider lists all service accounts grouped by identity
+// provider, then configuration name, then parent user.
+func (adm *AdminClient) ListAccessKeysByProvider(ctx context.Context) (ListAccessKeysByProviderResp, error) {
+	reqData := requestData{
+		relPath: adminAPIPrefix + "/list-access-keys-grouped",
+	}
+
+	// Execute GET on /minio/admin/v4/list-access-keys-grouped
+	resp, err := adm.executeMethod(ctx, http.MethodGet, reqData)
+	defer closeResponse(resp)
+	if err != nil {
+		return ListAccessKeysByProviderResp{}, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return ListAccessKeysByProviderResp{}, httpRespToErrorResponse(resp)
+	}
+
+	data, err := DecryptData(adm.getSecretKey(), resp.Body)
+	if err != nil {
+		return ListAccessKeysByProviderResp{}, err
+	}
+
+	var listResp ListAccessKeysByProviderResp
+	if err = json.Unmarshal(data, &listResp); err != nil {
+		return ListAccessKeysByProviderResp{}, err
+	}
+	return listResp, nil
+}
+
 // InfoServiceAccountResp is the response body of the info service account call
 type InfoServiceAccountResp struct {
-	ParentUser    string     `json:"parentUser"`
-	AccountStatus string     `json:"accountStatus"`
-	ImpliedPolicy bool       `json:"impliedPolicy"`
-	Policy        string     `json:"policy"`
-	Name          string     `json:"name,omitempty"`
-	Description   string     `json:"description,omitempty"`
-	Expiration    *time.Time `json:"expiration,omitempty"`
+	ParentUser       string     `json:"parentUser"`
+	ParentUserStatus string     `json:"parentUserStatus,omitempty"`
+	AccountStatus    string     `json:"accountStatus"`
+	ImpliedPolicy    bool       `json:"impliedPolicy"`
+	Policy           string     `json:"policy"`
+	Name             string     `json:"name,omitempty"`
+	Description      string     `json:"description,omitempty"`
+	Expiration       *time.Time `json:"expiration,omitempty"`
 }
 
 // InfoServiceAccount - returns the info of service account belonging to the specified user
@@ -891,12 +1014,15 @@ func (r *RevokeTokensReq) Validate() error {
 	return nil
 }
 
-func (adm *AdminClient) revokeTokens(ctx context.Context, opts RevokeTokensReq, provider string) error {
+func (adm *AdminClient) revokeTokens(ctx context.Context, opts RevokeTokensReq, provider, issuer string) error {
 	queryValues := url.Values{}
 	queryValues.Set("user", opts.User)
 	queryValues.Set("tokenRevokeType", opts.TokenRevokeType)
 	if opts.FullRevoke {
 		queryValues.Set("fullRevoke", "true")
+	}
+	if issuer != "" {
+		queryValues.Set("issuer", issuer)
 	}
 
 	reqData := requestData{
@@ -921,12 +1047,19 @@ func (adm *AdminClient) revokeTokens(ctx context.Context, opts RevokeTokensReq, 
 // RevokeTokens - revokes tokens for the specified builtin user, or
 // for an external (LDAP, OpenID, etc.) user being sent by one of its STS credentials.
 func (adm *AdminClient) RevokeTokens(ctx context.Context, opts RevokeTokensReq) error {
-	return adm.revokeTokens(ctx, opts, BuiltinProvider)
+	return adm.revokeTokens(ctx, opts, BuiltinProvider, "")
 }
 
 // RevokeTokensLDAP - revokes tokens for the specified LDAP user.
 func (adm *AdminClient) RevokeTokensLDAP(ctx context.Context, opts RevokeTokensReq) error {
-	return adm.revokeTokens(ctx, opts, LDAPProvider)
+	return adm.revokeTokens(ctx, opts, LDAPProvider, "")
+}
+
+// RevokeTokensOpenID revokes tokens for the OpenID subject in opts.User.
+// issuer names the OpenID provider; it may be empty when the server has only
+// one.
+func (adm *AdminClient) RevokeTokensOpenID(ctx context.Context, opts RevokeTokensReq, issuer string) error {
+	return adm.revokeTokens(ctx, opts, OpenIDProvider, issuer)
 }
 
 type LDAPSpecificAccessKeyInfo struct {
@@ -984,4 +1117,53 @@ func (adm *AdminClient) InfoAccessKey(ctx context.Context, accessKey string) (In
 		return InfoAccessKeyResp{}, err
 	}
 	return infoResp, nil
+}
+
+// IAMCacheAnalysis represents statistics about IAM cache entities
+type IAMCacheAnalysis struct {
+	TotalPolicies            int `json:"totalPolicies"`            // Total number of IAM policies
+	TotalRegularUsers        int `json:"totalRegularUsers"`        // Count of regular IAM users
+	TotalServiceAccounts     int `json:"totalServiceAccounts"`     // Count of service account users
+	TotalSvcAccNonRootParent int `json:"totalSvcAccNonRootParent"` // Count of service accounts whose ParentUser is not the root user
+	TotalGroups              int `json:"totalGroups"`              // Total number of IAM groups
+	TotalUserPolicyMappings  int `json:"totalUserPolicyMappings"`  // Count of user-to-policy mappings
+	TotalGroupPolicyMappings int `json:"totalGroupPolicyMappings"` // Count of group-to-policy mappings
+	TotalSTSPolicyMappings   int `json:"totalSTSPolicyMappings"`   // Count of STS-to-policy mappings
+}
+
+// HasReplicationEntities returns true if there are any non-root IAM entities
+func (i IAMCacheAnalysis) HasReplicationEntities() bool {
+	return i.TotalPolicies > 0 ||
+		i.TotalRegularUsers > 0 ||
+		i.TotalSvcAccNonRootParent > 0 ||
+		i.TotalGroups > 0 ||
+		i.TotalUserPolicyMappings > 0 ||
+		i.TotalGroupPolicyMappings > 0 ||
+		i.TotalSTSPolicyMappings > 0
+}
+
+// IAMEntityReport returns statistics about IAM cache entities
+func (adm *AdminClient) IAMEntityReport(ctx context.Context) (IAMCacheAnalysis, error) {
+	reqData := requestData{
+		relPath: adminAPIPrefix + "/iam-entity-report",
+	}
+
+	// Execute GET on /minio/admin/v3/iam-entity-report
+	resp, err := adm.executeMethod(ctx, http.MethodGet, reqData)
+	defer closeResponse(resp)
+	if err != nil {
+		return IAMCacheAnalysis{}, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return IAMCacheAnalysis{}, httpRespToErrorResponse(resp)
+	}
+
+	data, err := DecryptData(adm.getSecretKey(), resp.Body)
+	if err != nil {
+		return IAMCacheAnalysis{}, err
+	}
+
+	var report IAMCacheAnalysis
+	return report, json.Unmarshal(data, &report)
 }

@@ -21,11 +21,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 //msgp:tag json
-//go:generate msgp -d clearomitted -d "timezone utc" -file $GOFILE
+//go:generate go tool msgp -d clearomitted -d "timezone utc" -file $GOFILE
 
 // ObjectVersion object version key/versionId
 type ObjectVersion struct {

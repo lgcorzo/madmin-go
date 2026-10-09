@@ -42,13 +42,17 @@ const (
 	BatchJobKeyRotate BatchJobType = "keyrotate"
 	BatchJobExpire    BatchJobType = "expire"
 	BatchJobCatalog   BatchJobType = "catalog"
+	BatchJobUntier    BatchJobType = "untier"
+	BatchJobCompress  BatchJobType = "compress"
 )
 
 const (
 	BatchJobStatusCompleted  BatchJobStatusType = "completed"
 	BatchJobStatusFailed     BatchJobStatusType = "failed"
+	BatchJobStatusCanceled   BatchJobStatusType = "canceled"
 	BatchJobStatusInProgress BatchJobStatusType = "in-progress"
 	BatchJobStatusUnknown    BatchJobStatusType = "unknown"
+	BatchJobStatusWaiting    BatchJobStatusType = "waiting"
 )
 
 // SupportedJobTypes supported job types
@@ -154,6 +158,8 @@ const BatchJobKeyRotateTemplate = `keyrotate:
         - key: "content-type"
           value: "image/*" # match objects with 'content-type', with all values starting with 'image/'
       kmskey: "key-id" # match objects with KMS key-id (applicable only for sse-kms)
+      plaintextOnly: true # only encrypt unencrypted objects (skip SSE-S3, SSE-KMS, SSE-C encrypted objects)
+      forceEncryptLocked: false # encrypt objects under retention (object lock)
     notify:
       endpoint: "https://notify.endpoint" # notification endpoint to receive job status events
       token: "Bearer xxxxx" # optional authentication token for the notification endpoint
@@ -203,10 +209,26 @@ const BatchJobExpireTemplate = `expire:
     delay: 500ms # least amount of delay between each retry
 `
 
+// BatchJobUntierTemplate provides a sample template
+// for batch untier jobs
+const BatchJobUntierTemplate = `untier:
+  apiVersion: v1
+  bucket: mybucket
+
+  notify:
+    endpoint: https://notify.endpoint
+    token: Bearer xxxxx
+
+  retry:
+    attempts: 3
+    delay: 250ms
+`
+
 // BatchJobResult returned by StartBatchJob
 type BatchJobResult struct {
 	ID      string             `json:"id"`
 	Type    BatchJobType       `json:"type"`
+	Bucket  string             `json:"bucket,omitempty"`
 	User    string             `json:"user,omitempty"`
 	Started time.Time          `json:"started"`
 	Elapsed time.Duration      `json:"elapsed,omitempty"`
@@ -315,6 +337,8 @@ func (adm *AdminClient) GenerateBatchJob(_ context.Context, opts GenerateBatchJo
 		return BatchJobKeyRotateTemplate, nil
 	case BatchJobExpire:
 		return BatchJobExpireTemplate, nil
+	case BatchJobUntier:
+		return BatchJobUntierTemplate, nil
 	}
 	return "", fmt.Errorf("unknown batch job requested: %s", opts.Type)
 }
@@ -391,6 +415,7 @@ type ListBatchJobsResult struct {
 // filtering params.
 type ListBatchJobsFilter struct {
 	ByJobType string
+	ByBucket  string
 }
 
 // ListBatchJobs list all the currently active batch jobs
@@ -401,6 +426,7 @@ func (adm *AdminClient) ListBatchJobs(ctx context.Context, fl *ListBatchJobsFilt
 
 	values := make(url.Values)
 	values.Set("jobType", fl.ByJobType)
+	values.Set("bucket", fl.ByBucket)
 
 	resp, err := adm.executeMethod(ctx, http.MethodGet,
 		requestData{

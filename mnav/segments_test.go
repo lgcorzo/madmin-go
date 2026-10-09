@@ -1,0 +1,755 @@
+// Copyright (c) 2015-2026 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+package mnav
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/lgcorzo/madmin-go/v4"
+)
+
+// dupFirstTime is the start of a 97-slot quarter-hour timeline, so slot 0 and slot
+// 96 are both named 10:00Z.
+var dupFirstTime = time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+
+const dupKey = "10:00Z"
+
+// The newest instant owns a shared key even when the slots arrive out of order.
+func TestSegmentTimeOwners(t *testing.T) {
+	times := []time.Time{
+		dupFirstTime.Add(24 * time.Hour), // 10:00Z, one day on
+		dupFirstTime.Add(15 * time.Minute),
+		dupFirstTime, // 10:00Z
+	}
+	owners := segmentTimeOwners(times)
+	if got, want := len(owners), 2; got != want {
+		t.Fatalf("owners = %v, want %d distinct keys", owners, want)
+	}
+	if got, want := owners[dupKey], 0; got != want {
+		t.Errorf("owner of %s = %d, want slot %d (the newest instant)", dupKey, got, want)
+	}
+}
+
+// dupWindow is a day window whose first and last slot collide on one key, carrying
+// old in the oldest slot and new in the newest.
+func dupWindow[T any, PT segPtr[T]](old, recent T) madmin.Segmented[T, PT] {
+	segments := make([]T, 97)
+	segments[0] = old
+	segments[96] = recent
+	return madmin.Segmented[T, PT]{Interval: 900, FirstTime: dupFirstTime, Segments: segments}
+}
+
+// A key is a bare wall-clock time, so a window that reaches 24 hours -- what
+// Segmented.Add yields when two contributors' FirstTime differ by one interval --
+// has two slots wanting one name. Every family sharing the key format must list it
+// once and resolve it to the newest slot.
+func TestDuplicateSegmentKeysAcrossFamilies(t *testing.T) {
+	rpcDay := dupWindow[madmin.RPCStats, *madmin.RPCStats](
+		madmin.RPCStats{Requests: 7, RequestTimeSecs: 0.7},
+		madmin.RPCStats{Requests: 11, RequestTimeSecs: 1.1},
+	)
+	replDay := dupWindow[madmin.ReplicationStats, *madmin.ReplicationStats](
+		madmin.ReplicationStats{Nodes: 1, Events: 7},
+		madmin.ReplicationStats{Nodes: 1, Events: 11},
+	)
+	tableReads := make([]int64, 97)
+	tableReads[0], tableReads[96] = 7, 11
+
+	for _, tt := range []struct {
+		name string
+		node MetricNode
+		// dup is the key both slots want, "" for the start-of-segment default.
+		dup  string
+		key  string
+		want string
+	}{
+		{
+			name: "tables",
+			node: &tableSegmentedNode{
+				seg: &madmin.SegmentedTableIO{
+					IntervalSecs: 900, FirstTime: dupFirstTime, Reads: tableReads,
+				},
+				windowSecs: 86400, flag: madmin.MetricsDayStats,
+			},
+			key: "Reads", want: "11",
+		},
+		{
+			name: "rpc handler",
+			node: &RPCLastDayHandlerNode{handlerName: "storage.ReadAll", segmented: rpcDay},
+			key:  "Total Requests", want: "11",
+		},
+		{
+			name: "rpc all handlers",
+			node: &RPCLastDayAllNode{rpc: &madmin.RPCMetrics{
+				LastDay: map[string]madmin.SegmentedRPCMetrics{"storage.ReadAll": rpcDay},
+			}},
+			key: "Total Requests", want: "11",
+		},
+		{
+			name: "replication target",
+			node: NewReplicationLastDayNode("arn:target", &replDay, nil, "replication/target/last_day"),
+			key:  "Total Events", want: "11",
+		},
+		{
+			name: "replication aggregated",
+			node: NewReplicationLastDayAggregatedNode(&madmin.ReplicationMetrics{
+				Nodes:   1,
+				Targets: map[string]madmin.ReplicationTargetStats{"arn:target": {Nodes: 1, LastDay: &replDay}},
+			}, nil, "replication/last_day"),
+			key: "Total Events", want: "11",
+		},
+		{
+			name: "healing",
+			node: func() MetricNode {
+				w := dupWindow[madmin.HealingCounts, *madmin.HealingCounts](
+					madmin.HealingCounts{Started: 7}, madmin.HealingCounts{Started: 11},
+				)
+				return NewHealingLastDayNode(&w, nil, "healing/last_day")
+			}(),
+			key: "Started", want: "11",
+		},
+		{
+			// Keyed by the segment start, like every family above it. It used to
+			// name a segment by the instant it ended, putting its keys one
+			// interval on from everyone else's for the same slot.
+			name: "process",
+			node: func() MetricNode {
+				w := dupWindow[madmin.ProcessSegment, *madmin.ProcessSegment](
+					madmin.ProcessSegment{N: 1, CPUPercent: 7}, madmin.ProcessSegment{N: 1, CPUPercent: 11},
+				)
+				return NewProcessLastDayNode(&w, nil, "process/last_day")
+			}(),
+			key: "CPU", want: "11.00% per process",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dup := tt.dup
+			if dup == "" {
+				dup = dupKey
+			}
+			names := childNames(tt.node.GetChildren())
+			seen := map[string]int{}
+			for _, name := range names {
+				seen[name]++
+				if _, err := tt.node.GetChild(name); err != nil {
+					t.Errorf("GetChild(%q) = %v, want a node: everything listed must resolve", name, err)
+				}
+			}
+			for name, n := range seen {
+				if n != 1 {
+					t.Errorf("child %q listed %d times in %v, want exactly once", name, n, names)
+				}
+			}
+			if seen[dup] == 0 {
+				t.Fatalf("children = %v, want the shared key %s among them", names, dup)
+			}
+
+			child, err := tt.node.GetChild(dup)
+			if err != nil {
+				t.Fatalf("GetChild(%q): %v", dup, err)
+			}
+			if got := leafValue(child.GetLeafData(), tt.key); got != tt.want {
+				t.Errorf("%s = %q, want %q from the newest slot", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+// A row key is a UTC start and nothing else. It is what an operator greps a log
+// with, so it must not drift with the reader's zone, and it must not carry an end
+// time: every segment in a window is the same fixed size, stated once by the
+// Coverage row, and a full span wraps the narrow column and squeezes the value.
+//
+// Families used to format this themselves, and cpu keyed the reader's local clock
+// while its siblings keyed UTC -- the same instant under two names, and ambiguous
+// across a DST fold.
+func TestSegmentRowKeyIsUTCStartOnly(t *testing.T) {
+	// 00:30 UTC, which is a different day in the reader's zone if that zone is far
+	// enough east, so a key built from local time cannot coincidentally match.
+	start := time.Date(2026, 8, 12, 0, 30, 0, 0, time.UTC)
+	end := start.Add(15 * time.Minute)
+
+	for _, tz := range []string{"UTC", "Australia/Sydney", "America/Los_Angeles"} {
+		loc, err := time.LoadLocation(tz)
+		if err != nil {
+			t.Skipf("zone %s unavailable: %v", tz, err)
+		}
+		t.Run(tz, func(t *testing.T) {
+			// segmentRowKey must read the instant, not the zone it is carried in.
+			got := segmentRowKey(3, start.In(loc), end.In(loc))
+			if want := "03: 00:30Z"; got != want {
+				t.Errorf("segmentRowKey = %q, want %q", got, want)
+			}
+		})
+	}
+
+	// The key and the navigation name must name the same instant, or a row cannot be
+	// matched to the child that drills into it.
+	if key, name := segmentRowKey(0, start, end), segmentKey(start); !strings.HasSuffix(key, name) {
+		t.Errorf("row key %q does not end in the navigation name %q", key, name)
+	}
+}
+
+// The helper above is only worth as much as the families using it, so this checks
+// a real one end to end. CPU is the family that used to format its own key from
+// the reader's local clock.
+func TestCPUWindowRowKeyIsUTC(t *testing.T) {
+	loc, err := time.LoadLocation("Australia/Sydney")
+	if err != nil {
+		t.Skipf("zone unavailable: %v", err)
+	}
+	start := time.Date(2026, 8, 12, 0, 30, 0, 0, time.UTC)
+
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{CPU: &madmin.CPUMetrics{
+			LastHour: &madmin.SegmentedCPUMetrics{
+				Interval:  60,
+				FirstTime: start.In(loc),
+				Segments:  []madmin.CPUSegment{{N: 1, User: 10, System: 5, Idle: 85}},
+			},
+		}},
+	})
+	node, err := nav.Navigate("cpu/last_hour")
+	if err != nil {
+		t.Fatalf("navigate cpu/last_hour: %v", err)
+	}
+	data := node.GetLeafData()
+	var found bool
+	for key := range data {
+		// Matches the row whatever zone it was rendered in: 00:30Z is 10:30 in
+		// Sydney and 02:30 in Berlin, and every one of those ends in "0:30".
+		if !strings.Contains(key, "0:30") {
+			continue
+		}
+		found = true
+		if !strings.HasSuffix(key, "00:30Z") {
+			t.Errorf("row key %q, want it to end in the UTC start 00:30Z: a local-clock "+
+				"key names the same instant differently for every reader", key)
+		}
+	}
+	if !found {
+		t.Errorf("no segment row found in %v", data)
+	}
+}
+
+// A segment's N is one sample per node, so an _ALL entry -- which sums every
+// segment in the window -- carries one per node per segment. Rendering that raw
+// reported a 5-node cluster over a 60-segment hour as "312 node sample(s)", which
+// reads as a node count and is off by the segment count.
+func TestFormatNodeCountDividesByMergeCount(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		n        int
+		segments int
+		want     string
+	}{
+		{"single segment", 5, 1, "5 node(s)"},
+		// The reported case: 60 one-minute segments, 5 nodes throughout.
+		{"whole hour, stable cluster", 300, 60, "5 node(s)"},
+		// A node that joined or left mid-window contributed to only some segments, so
+		// the average is fractional and that is real information, not noise.
+		{"whole hour, node joined midway", 312, 60, "5.2 node(s) avg"},
+		// Defensive: a merge count of zero must not divide by zero.
+		{"unknown merge count", 7, 0, "7 node(s)"},
+	} {
+		if got := formatNodeCount(tc.n, tc.segments); got != tc.want {
+			t.Errorf("%s: formatNodeCount(%d, %d) = %q, want %q",
+				tc.name, tc.n, tc.segments, got, tc.want)
+		}
+	}
+}
+
+// The same invariant end to end: an _ALL leaf must report the node count, not the
+// node count times the number of segments it summed.
+func TestWindowAllLeafReportsNodeCount(t *testing.T) {
+	const nodes, segments = 5, 12
+	segs := make([]madmin.LockSegment, segments)
+	for i := range segs {
+		segs[i] = madmin.LockSegment{N: nodes, AcquireCount: 10, AcquireNanos: 1_000_000}
+	}
+	nav := lockNav(t, &madmin.LockMetrics{
+		LastHour: &madmin.SegmentedLockMetrics{
+			Interval: 60, FirstTime: lockFirstTime, Segments: segs,
+		},
+	})
+	all, err := nav.Navigate("locks/last_hour/_ALL")
+	if err != nil {
+		t.Fatalf("navigate _ALL: %v", err)
+	}
+	d := all.GetLeafData()
+	if got, want := leafValue(d, "Nodes"), "5 node(s)"; got != want {
+		t.Errorf("Nodes = %q, want %q: summing N over %d segments gives %d",
+			got, want, segments, nodes*segments)
+	}
+	// The counters really are cross-segment sums, so those must NOT be divided.
+	if got, want := leafValue(d, "Acquires"), "120"; got != want {
+		t.Errorf("Acquires = %q, want %q: a counter still sums over the window", got, want)
+	}
+}
+
+// The API family reaches the same invariant by a different route: APIStats.Merge
+// sums Nodes, which is only right along the node axis. Folding a day of segments
+// into one endpoint total walks the time axis instead, where every segment
+// carries the same nodes. A 3-node cluster over 95 quarter-hour segments reported
+// "285 nodes", which reads as a fleet size and is off by the segment count.
+func TestAPIEndpointLeavesReportNodeCount(t *testing.T) {
+	const nodes, segments = 3, 95
+	segs := make([]madmin.APIStats, segments)
+	for i := range segs {
+		segs[i] = madmin.APIStats{
+			Nodes: nodes, Requests: 1000, IncomingBytes: 4096,
+			RequestTimeSecs: 4.0, RespTTFBSecsMax: 0.3,
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{API: &madmin.APIMetrics{
+			Nodes: nodes,
+			LastDayAPI: map[string]madmin.SegmentedAPIMetrics{
+				"s3.PutObject": {Interval: 900, FirstTime: dupFirstTime, Segments: segs},
+			},
+		}},
+	})
+
+	// The endpoint leaf and its Total child fold the same segments; both used to
+	// inflate, so both are pinned.
+	for _, path := range []string{
+		"api/last_day/s3.PutObject",
+		"api/last_day/s3.PutObject/Total",
+	} {
+		node, err := nav.Navigate(path)
+		if err != nil {
+			t.Fatalf("navigate %s: %v", path, err)
+		}
+		data := node.GetLeafData()
+		if got, want := leafValue(data, "Responding Nodes"), "3 nodes"; got != want {
+			t.Errorf("%s: Responding Nodes = %q, want %q: summing Nodes over %d segments gives %d",
+				path, got, want, segments, nodes*segments)
+		}
+		// The request counters really are cross-segment sums, so those must NOT be reset.
+		if got, want := leafValue(data, "Total Requests"), "95,000"; got != want {
+			t.Errorf("%s: Total Requests = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// A single time segment is already a per-node fan-in, so it reports the node
+// count directly -- the fold is what has to be corrected, not the segment.
+func TestAPITimeSegmentLeafReportsNodeCount(t *testing.T) {
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{API: &madmin.APIMetrics{
+			Nodes: 3,
+			LastDayAPI: map[string]madmin.SegmentedAPIMetrics{
+				"s3.PutObject": {
+					Interval: 900, FirstTime: dupFirstTime,
+					Segments: []madmin.APIStats{{Nodes: 3, Requests: 1000, RequestTimeSecs: 4.0}},
+				},
+			},
+		}},
+	})
+	node, err := nav.Navigate("api/last_day/s3.PutObject/" + dupFirstTime.Format("15:04Z"))
+	if err != nil {
+		t.Fatalf("navigate segment: %v", err)
+	}
+	if got, want := leafValue(node.GetLeafData(), "Responding Nodes"), "3 nodes"; got != want {
+		t.Errorf("Responding Nodes = %q, want %q", got, want)
+	}
+}
+
+// A rate needs the window its stats cover, and WallTimeSecs is not that window:
+// Merge sums it from every source folded in, so a minute of 20 operations on 16
+// nodes carries 19200 seconds. Dividing by it read a 100k-request minute as
+// "5.2 req/sec", while the api overview page above it read the same minute
+// correctly.
+func TestAPILastMinuteRateUsesTheMinute(t *testing.T) {
+	const nodes, endpoints = 16, 20
+	api := &madmin.APIMetrics{
+		Nodes:         nodes,
+		LastMinuteAPI: make(map[string]madmin.APIStats, endpoints),
+	}
+	for i := range endpoints {
+		api.LastMinuteAPI[fmt.Sprintf("s3.Op%02d", i)] = madmin.APIStats{
+			Nodes: nodes, Requests: 5000, WallTimeSecs: 60 * nodes, RequestTimeSecs: 500,
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{API: api},
+	})
+
+	// 100,000 requests in a minute.
+	total, err := nav.Navigate("api/last_minute")
+	if err != nil {
+		t.Fatalf("navigate last_minute: %v", err)
+	}
+	if got, want := leafValue(total.GetLeafData(), "Request Rate"), "1666.7 req/sec"; got != want {
+		t.Errorf("last_minute Request Rate = %q, want %q: dividing by the summed wall time (%d s) gives %.1f",
+			got, want, 60*nodes*endpoints, 100000.0/float64(60*nodes*endpoints))
+	}
+
+	// The overview page one level up derives the same minute from the request
+	// count alone; the two must not disagree.
+	overview, err := nav.Navigate("api")
+	if err != nil {
+		t.Fatalf("navigate api: %v", err)
+	}
+	if got := leafValue(overview.GetLeafData(), "Request Rate"); !strings.Contains(got, "1666.7 req/sec") {
+		t.Errorf("api overview Request Rate = %q, want it to contain 1666.7 req/sec", got)
+	}
+
+	// A single endpoint covers the same minute, not 16 nodes' worth of it.
+	ep, err := nav.Navigate("api/last_minute/s3.Op00")
+	if err != nil {
+		t.Fatalf("navigate endpoint: %v", err)
+	}
+	if got, want := leafValue(ep.GetLeafData(), "Request Rate"), "83.3 req/sec"; got != want {
+		t.Errorf("endpoint Request Rate = %q, want %q", got, want)
+	}
+}
+
+// The same defect one level down, where only the node axis is folded: a quarter
+// hour of one endpoint on 17 nodes carries 15300 wall seconds, reading 1832
+// requests as "0.1 req/sec" while the segment listing said 122.1 req/min --
+// 2.0 req/sec -- for the very same numbers.
+func TestAPILastDayRateUsesSegmentWindow(t *testing.T) {
+	const nodes, segments = 17, 2
+	segs := make([]madmin.APIStats, segments)
+	for i := range segs {
+		segs[i] = madmin.APIStats{
+			Nodes: nodes, Requests: 1832, WallTimeSecs: 900 * nodes, RequestTimeSecs: 2512,
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{API: &madmin.APIMetrics{
+			Nodes: nodes,
+			LastDayAPI: map[string]madmin.SegmentedAPIMetrics{
+				"s3.HeadBucket": {Interval: 900, FirstTime: dupFirstTime, Segments: segs},
+			},
+		}},
+	})
+
+	// One segment covers 900 s; the folds below cover both, 1800 s for twice the
+	// requests, so every one of them lands on the same rate.
+	for _, path := range []string{
+		"api/last_day/s3.HeadBucket/" + dupKey,
+		"api/last_day/s3.HeadBucket/Total",
+		"api/last_day/s3.HeadBucket",
+		"api/last_day/_by_time/" + dupKey + "/_ALL",
+		"api/last_day",
+	} {
+		node, err := nav.Navigate(path)
+		if err != nil {
+			t.Fatalf("navigate %s: %v", path, err)
+		}
+		if got, want := leafValue(node.GetLeafData(), "Request Rate"), "2.0 req/sec"; got != want {
+			t.Errorf("%s: Request Rate = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// Since-start is the one API view with no window of its own, so the node count is
+// what gets divided back out: 3 nodes up for an hour carry 10800 wall seconds.
+func TestAPISinceStartRateDividesNodesOut(t *testing.T) {
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{API: &madmin.APIMetrics{
+			Nodes: 3,
+			SinceStart: madmin.APIStats{
+				Nodes: 3, Requests: 36000, WallTimeSecs: 3600 * 3, RequestTimeSecs: 3600,
+			},
+		}},
+	})
+	node, err := nav.Navigate("api/since_start")
+	if err != nil {
+		t.Fatalf("navigate since_start: %v", err)
+	}
+	if got, want := leafValue(node.GetLeafData(), "Request Rate"), "10.0 req/sec"; got != want {
+		t.Errorf("Request Rate = %q, want %q", got, want)
+	}
+}
+
+// Replication divides by the same field, and folds along the target axis on top
+// of the node one: two targets on 3 nodes turn an hour into 21600 seconds, which
+// reported a sixth of the real throughput and a six-hour duration.
+func TestReplicationRateUsesKnownWindow(t *testing.T) {
+	const nodes, targets = 3, 2
+	start := dupFirstTime
+	end := start.Add(time.Hour)
+	day := make([]madmin.ReplicationStats, 96)
+	for i := range day {
+		day[i] = madmin.ReplicationStats{
+			Nodes: nodes, Events: 100, Bytes: 900_000_000, WallTimeSecs: 900 * nodes,
+		}
+	}
+	rm := &madmin.ReplicationMetrics{
+		Nodes:   nodes,
+		Targets: make(map[string]madmin.ReplicationTargetStats, targets),
+	}
+	for i := range targets {
+		rm.Targets[fmt.Sprintf("peer%d:bucket", i)] = madmin.ReplicationTargetStats{
+			Nodes: nodes,
+			LastHour: madmin.ReplicationStats{
+				Nodes: nodes, StartTime: &start, EndTime: &end,
+				Events: 1000, Bytes: 1_800_000_000, WallTimeSecs: 3600 * nodes,
+			},
+			LastDay: &madmin.SegmentedReplicationStats{
+				Interval: 900, FirstTime: dupFirstTime, Segments: day,
+			},
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{Replication: rm},
+	})
+
+	// 3.6 GB over the hour, across both targets.
+	hour, err := nav.Navigate("replication/last_hour")
+	if err != nil {
+		t.Fatalf("navigate last_hour: %v", err)
+	}
+	data := hour.GetLeafData()
+	if got, want := leafValue(data, "Throughput"), "1.0 MB/s"; got != want {
+		t.Errorf("Throughput = %q, want %q: the summed wall time is %d s", got, want, 3600*nodes*targets)
+	}
+	if got, want := leafValue(data, "Duration"), "3600.0 seconds"; got != want {
+		t.Errorf("Duration = %q, want %q", got, want)
+	}
+
+	// A folded day covers its segments: 86.4 GB over 96 quarter hours, per target.
+	total, err := nav.Navigate("replication/peer0:bucket/last_day/Total")
+	if err != nil {
+		t.Fatalf("navigate last_day/Total: %v", err)
+	}
+	if got, want := leafValue(total.GetLeafData(), "Throughput"), "1.0 MB/s"; got != want {
+		t.Errorf("last_day Total Throughput = %q, want %q", got, want)
+	}
+}
+
+// Replication folds along the target axis rather than time, but the invariant is
+// the same: every target is reported by the same nodes, so 46 targets on a 3-node
+// cluster reported "138".
+func TestReplicationLastHourLeafReportsNodeCount(t *testing.T) {
+	const nodes, targets = 3, 46
+	rm := &madmin.ReplicationMetrics{
+		Nodes:   nodes,
+		Targets: make(map[string]madmin.ReplicationTargetStats, targets),
+	}
+	for i := range targets {
+		rm.Targets[fmt.Sprintf("peer%d:bucket-%d", i, i)] = madmin.ReplicationTargetStats{
+			Nodes:      nodes,
+			LastHour:   madmin.ReplicationStats{Nodes: nodes, Events: 7000, PutObject: 7000},
+			SinceStart: madmin.ReplicationStats{Nodes: nodes, Events: 90000},
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{Replication: rm},
+	})
+
+	node, err := nav.Navigate("replication/last_hour")
+	if err != nil {
+		t.Fatalf("navigate replication/last_hour: %v", err)
+	}
+	data := node.GetLeafData()
+	if got, want := leafValue(data, "Nodes Reporting"), "3"; got != want {
+		t.Errorf("Nodes Reporting = %q, want %q: summing Nodes over %d targets gives %d",
+			got, want, targets, nodes*targets)
+	}
+	// Events are additive across targets and must survive the reset.
+	if got, want := leafValue(data, "Total Events"), "322,000"; got != want {
+		t.Errorf("Total Events = %q, want %q", got, want)
+	}
+}
+
+// Replication's last-day Total nodes fold via the generic Segmented.Total,
+// which cannot correct a node count because T is opaque to it. Both the
+// per-target and the all-targets path reported "288" for 96 quarter-hour
+// segments on a 3-node cluster.
+func TestReplicationDayTotalLeavesReportNodeCount(t *testing.T) {
+	const nodes, segments = 3, 96
+	segs := make([]madmin.ReplicationStats, segments)
+	for i := range segs {
+		segs[i] = madmin.ReplicationStats{Nodes: nodes, Events: 100, PutObject: 100}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{Replication: &madmin.ReplicationMetrics{
+			Nodes: nodes,
+			Targets: map[string]madmin.ReplicationTargetStats{
+				"peer:bucket": {
+					Nodes:    nodes,
+					LastHour: madmin.ReplicationStats{Nodes: nodes, Events: 10},
+					LastDay: &madmin.SegmentedReplicationStats{
+						Interval: 900, FirstTime: dupFirstTime, Segments: segs,
+					},
+				},
+			},
+		}},
+	})
+
+	for _, path := range []string{
+		"replication/last_day/Total",
+		"replication/peer:bucket/last_day/Total",
+	} {
+		node, err := nav.Navigate(path)
+		if err != nil {
+			t.Fatalf("navigate %s: %v", path, err)
+		}
+		data := node.GetLeafData()
+		if got, want := leafValue(data, "Nodes Reporting"), "3"; got != want {
+			t.Errorf("%s: Nodes Reporting = %q, want %q: summing Nodes over %d segments gives %d",
+				path, got, want, segments, nodes*segments)
+		}
+		// Events are a real cross-segment sum and must not be reset.
+		if got, want := leafValue(data, "Total Events"), "9,600"; got != want {
+			t.Errorf("%s: Total Events = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// A capture whose top-level node count never got filled in still has per-target
+// counts, and clamping to zero would drop "Nodes Reporting" from every segment
+// and from the total. The per-target maximum stands in instead.
+func TestReplicationDayAggregatedWithoutNodeCount(t *testing.T) {
+	day := func() *madmin.SegmentedReplicationStats {
+		return &madmin.SegmentedReplicationStats{
+			Interval: 900, FirstTime: dupFirstTime,
+			Segments: []madmin.ReplicationStats{{Nodes: 2, Events: 100, PutObject: 100}},
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{Replication: &madmin.ReplicationMetrics{
+			Targets: map[string]madmin.ReplicationTargetStats{
+				"peer:a": {Nodes: 2, LastDay: day()},
+				"peer:b": {Nodes: 2, LastDay: day()},
+			},
+		}},
+	})
+
+	for _, path := range []string{
+		"replication/last_day/" + dupFirstTime.Format("15:04Z"),
+		"replication/last_day/Total",
+	} {
+		node, err := nav.Navigate(path)
+		if err != nil {
+			t.Fatalf("navigate %s: %v", path, err)
+		}
+		data := node.GetLeafData()
+		if got, want := leafValue(data, "Nodes Reporting"), "2"; got != want {
+			t.Errorf("%s: Nodes Reporting = %q, want %q", path, got, want)
+		}
+		if got, want := leafValue(data, "Total Events"), "200"; got != want {
+			t.Errorf("%s: Total Events = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// The all-targets day view folds every target's window onto one timeline, so a
+// segment's node count comes out summed along the target axis. Two targets on a
+// 3-node cluster reported "6" for a segment all three nodes covered; each
+// segment is now bounded by the nodes that responded, per segment rather than
+// once for the window.
+func TestReplicationDayAggregatedNodeCountsArePerSegment(t *testing.T) {
+	day := func() *madmin.SegmentedReplicationStats {
+		return &madmin.SegmentedReplicationStats{
+			Interval: 900, FirstTime: dupFirstTime,
+			Segments: []madmin.ReplicationStats{
+				{Nodes: 3, Events: 100, PutObject: 100},
+				{Nodes: 1, Events: 10, PutObject: 10},
+			},
+		}
+	}
+	nav := NewRealtimeMetricsNavigator(&madmin.RealtimeMetrics{
+		Aggregated: madmin.Metrics{Replication: &madmin.ReplicationMetrics{
+			Nodes: 3,
+			Targets: map[string]madmin.ReplicationTargetStats{
+				"peer:a": {Nodes: 3, LastHour: madmin.ReplicationStats{Nodes: 3, Events: 5}, LastDay: day()},
+				"peer:b": {Nodes: 3, LastHour: madmin.ReplicationStats{Nodes: 3, Events: 5}, LastDay: day()},
+			},
+		}},
+	})
+
+	for _, tc := range []struct {
+		path, nodes, events string
+	}{
+		// Both targets cover this slot with all three nodes.
+		{"replication/last_day/" + dupFirstTime.Format("15:04Z"), "3", "200"},
+		// One node per target covered this slot. Whether that is the same node
+		// is not knowable from counts, so the sum stands under the bound of
+		// three; events still sum.
+		{"replication/last_day/" + dupFirstTime.Add(15*time.Minute).Format("15:04Z"), "2", "20"},
+		// The window total takes the widest segment, not the sum.
+		{"replication/last_day/Total", "3", "220"},
+	} {
+		node, err := nav.Navigate(tc.path)
+		if err != nil {
+			t.Fatalf("navigate %s: %v", tc.path, err)
+		}
+		data := node.GetLeafData()
+		if got := leafValue(data, "Nodes Reporting"); got != tc.nodes {
+			t.Errorf("%s: Nodes Reporting = %q, want %q", tc.path, got, tc.nodes)
+		}
+		if got := leafValue(data, "Total Events"); got != tc.events {
+			t.Errorf("%s: Total Events = %q, want %q", tc.path, got, tc.events)
+		}
+	}
+}
+
+// Microsecond precision is what a sub-second latency needs and pure noise on a
+// figure of minutes, which is how a mean failed-wait rendered as
+// "13m19.506473s".
+func TestDurationOfScalesPrecision(t *testing.T) {
+	for _, tc := range []struct {
+		acc, count uint64
+		want       string
+	}{
+		{0, 0, "n/a"},
+		{583_000, 1, "583µs"},
+		{20_599_000, 1, "20.599ms"},
+		// A second or more keeps milliseconds, not microseconds.
+		{1_131_456_789, 1, "1.131s"},
+		// A minute or more keeps whole seconds: this is the reported case, which used
+		// to render as "13m19.506473s".
+		{799_506_473_000, 1, "13m20s"},
+		// Still an average, so the division happens first.
+		{799_506_473_000 * 4, 4, "13m20s"},
+	} {
+		if got := durationOf(tc.acc, tc.count); got != tc.want {
+			t.Errorf("durationOf(%d, %d) = %q, want %q", tc.acc, tc.count, got, tc.want)
+		}
+	}
+}
+
+// A span below a minute must not render as "0m": coverDuration is generic, and a
+// window with a short interval would have reported its coverage as zero.
+func TestCoverDurationSubMinute(t *testing.T) {
+	for _, tc := range []struct {
+		secs int
+		want string
+	}{
+		{1, "1s"},
+		{15, "15s"},
+		{59, "59s"},
+		{60, "1m"},
+		{90, "2m"},
+		{900, "15m"},
+		{3600, "1h"},
+		{86400 - 900, "23h45m"},
+	} {
+		if got := coverDuration(time.Duration(tc.secs) * time.Second); got != tc.want {
+			t.Errorf("coverDuration(%ds) = %q, want %q", tc.secs, got, tc.want)
+		}
+	}
+}

@@ -26,10 +26,12 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/host"
 )
 
 //msgp:tag json
-//go:generate msgp -d clearomitted -d "timezone utc" -file $GOFILE
+//go:generate go tool msgp -d clearomitted -d "timezone utc" -file $GOFILE
 
 // BackendType - represents different backend types.
 type BackendType int
@@ -152,7 +154,14 @@ func (adm *AdminClient) StorageInfo(ctx context.Context) (StorageInfo, error) {
 // - total objects in a bucket
 // - object size histogram per bucket
 type BucketUsageInfo struct {
-	Size                    uint64 `json:"size"`
+	Size uint64 `json:"size"`
+	// On-disk size of compressed objects only; omitted when zero. The
+	// compression ratio for compressed objects is CompressedActualSize/CompressedSize.
+	CompressedSize uint64 `json:"compressedSize,omitempty"`
+	// Logical (pre-compression) size of compressed objects only; omitted when zero.
+	CompressedActualSize uint64 `json:"compressedActualSize,omitempty"`
+	// Number of object versions stored compressed; omitted when zero
+	CompressedVersionsCount uint64 `json:"compressedVersionsCount,omitempty"`
 	ReplicationPendingSize  uint64 `json:"objectsPendingReplicationTotalSize"`
 	ReplicationFailedSize   uint64 `json:"objectsFailedReplicationTotalSize"`
 	ReplicatedSize          uint64 `json:"objectsReplicatedTotalSize"`
@@ -160,11 +169,18 @@ type BucketUsageInfo struct {
 	ReplicationPendingCount uint64 `json:"objectsPendingReplicationCount"`
 	ReplicationFailedCount  uint64 `json:"objectsFailedReplicationCount"`
 
-	VersionsCount           uint64            `json:"versionsCount"`
-	ObjectsCount            uint64            `json:"objectsCount"`
-	DeleteMarkersCount      uint64            `json:"deleteMarkersCount"`
-	ObjectSizesHistogram    map[string]uint64 `json:"objectsSizesHistogram"`
-	ObjectVersionsHistogram map[string]uint64 `json:"objectsVersionsHistogram"`
+	VersionsCount      uint64 `json:"versionsCount"`
+	ObjectsCount       uint64 `json:"objectsCount"`
+	DeleteMarkersCount uint64 `json:"deleteMarkersCount"`
+
+	ObjectSizesHistogram      map[string]uint64 `json:"objectsSizesHistogram"`
+	ObjectVersionsHistogram   map[string]uint64 `json:"objectsVersionsHistogram"`
+	ObjectAgesHistogram       map[string]uint64 `json:"objectsAgesHistogram"`
+	ObjectAccessAgesHistogram map[string]uint64 `json:"objectsAccessAgesHistogram"`
+
+	LockActiveRetentionVersions  uint64 `json:"lockActiveRetentionVersions"`
+	LockExpiredRetentionVersions uint64 `json:"lockExpiredRetentionVersions"`
+	LockLegalHoldVersions        uint64 `json:"lockLegalHoldVersions"`
 }
 
 // DataUsageInfo represents data usage stats of the underlying Object API
@@ -178,6 +194,15 @@ type DataUsageInfo struct {
 
 	// Objects total size across all buckets
 	ObjectsTotalSize uint64 `json:"objectsTotalSize"`
+
+	// Total on-disk size of compressed objects only across all buckets; omitted when zero
+	ObjectsTotalCompressedSize uint64 `json:"objectsTotalCompressedSize,omitempty"`
+
+	// Total logical (pre-compression) size of compressed objects only across all buckets; omitted when zero
+	ObjectsTotalCompressedActualSize uint64 `json:"objectsTotalCompressedActualSize,omitempty"`
+
+	// Object versions stored compressed across all buckets; omitted when zero
+	ObjectsTotalCompressedVersions uint64 `json:"objectsTotalCompressedVersions,omitempty"`
 
 	// Total Size for objects that have not yet been replicated
 	ReplicationPendingSize uint64 `json:"objectsPendingReplicationTotalSize"`
@@ -208,6 +233,11 @@ type DataUsageInfo struct {
 
 	// TierStats holds per-tier stats like bytes tiered, etc.
 	TierStats map[string]TierStats `json:"tierStats"`
+
+	// Object lock stats across all buckets
+	LockActiveRetentionVersions  uint64 `json:"lockActiveRetentionVersions"`
+	LockExpiredRetentionVersions uint64 `json:"lockExpiredRetentionVersions"`
+	LockLegalHoldVersions        uint64 `json:"lockLegalHoldVersions"`
 
 	// Server capacity related data
 	TotalCapacity     uint64 `json:"capacity"`
@@ -304,6 +334,7 @@ type Services struct {
 	KMS           KMS                           `json:"kms,omitempty"` // deprecated july 2023
 	KMSStatus     []KMS                         `json:"kmsStatus,omitempty"`
 	LDAP          LDAP                          `json:"ldap,omitempty"`
+	LDAPStatus    map[string]LDAP               `json:"ldapStatus,omitempty"`
 	Logger        []Logger                      `json:"logger,omitempty"`
 	Audit         []Audit                       `json:"audit,omitempty"`
 	Notifications []map[string][]TargetIDStatus `json:"notifications,omitempty"`
@@ -446,27 +477,40 @@ type APIVersion struct {
 
 // ServerProperties holds server information
 type ServerProperties struct {
-	State               string            `json:"state,omitempty"`
-	Endpoint            string            `json:"endpoint,omitempty"`
-	Scheme              string            `json:"scheme,omitempty"`
-	Uptime              int64             `json:"uptime,omitempty"`
-	Version             string            `json:"version,omitempty"`
-	CommitID            string            `json:"commitID,omitempty"`
-	Network             map[string]string `json:"network,omitempty"`
-	Disks               []Disk            `json:"drives,omitempty"`
-	PoolNumber          int               `json:"poolNumber,omitempty"` // Only set if len(PoolNumbers) == 1
-	PoolNumbers         []int             `json:"poolNumbers,omitempty"`
-	MemStats            MemStats          `json:"mem_stats"`
-	GoMaxProcs          int               `json:"go_max_procs,omitempty"`
-	NumCPU              int               `json:"num_cpu,omitempty"`
-	RuntimeVersion      string            `json:"runtime_version,omitempty"`
-	GCStats             *GCStats          `json:"gc_stats,omitempty"`
-	MinioEnvVars        map[string]string `json:"minio_env_vars,omitempty"`
-	MinioEnvHash        string            `json:"minio_env_hash,omitempty"`
-	Edition             string            `json:"edition"`
-	License             *LicenseInfo      `json:"license,omitempty"`
-	IsLeader            bool              `json:"is_leader"`
+	State          string            `json:"state,omitempty"`
+	Endpoint       string            `json:"endpoint,omitempty"`
+	Scheme         string            `json:"scheme,omitempty"`
+	Uptime         int64             `json:"uptime,omitempty"`
+	Version        string            `json:"version,omitempty"`
+	CommitID       string            `json:"commitID,omitempty"`
+	Network        map[string]string `json:"network,omitempty"`
+	Disks          []Disk            `json:"drives,omitempty"`
+	PoolNumber     int               `json:"poolNumber,omitempty"` // Only set if len(PoolNumbers) == 1
+	PoolNumbers    []int             `json:"poolNumbers,omitempty"`
+	MemStats       MemStats          `json:"mem_stats"`
+	GoMaxProcs     int               `json:"go_max_procs,omitempty"`
+	NumCPU         int               `json:"num_cpu,omitempty"`
+	RuntimeVersion string            `json:"runtime_version,omitempty"`
+	MinioEnvVars   map[string]string `json:"minio_env_vars,omitempty"`
+	MinioEnvHash   string            `json:"minio_env_hash,omitempty"`
+	Edition        string            `json:"edition"`
+	License        *LicenseInfo      `json:"license,omitempty"`
+	// Deprecated: previously true on the single node that held all leader
+	// locks; now true on any node holding at least one per-task leader lock,
+	// which is typically most nodes. Use Leaders for the per-task breakdown
+	// instead.
+	IsLeader bool `json:"is_leader"`
+	// Leaders maps each leader lock name to the hostname:port of the node
+	// currently holding it. Only locks with a known holder are included.
+	Leaders             map[string]string `json:"leaders,omitempty"`
 	ILMExpiryInProgress bool              `json:"ilm_expiry_in_progress"`
+	Host                *HostInfoStat     `json:"host,omitempty"`
+	PID                 int32             `json:"pid,omitempty"`
+	CmdLine             string            `json:"cmd_line,omitempty"`
+	Username            string            `json:"username,omitempty"`
+	IsBackground        bool              `json:"is_background,omitempty"`
+	FirstCPU            *CPU              `json:"first_cpu,omitempty"`
+	CPUCount            int               `json:"cpu_count,omitempty"`
 
 	APIVersion      APIVersion `json:"api_version"`
 	RestartingSince time.Time  `json:"restarting_since,omitempty"`
@@ -503,6 +547,12 @@ type DiskStatus struct {
 
 	// Captures all timeout only errors
 	TotalErrorsTimeout uint64 `json:"totalErrorsTimeout,omitempty"`
+
+	// Captures silent data corruption errors (bitrot)
+	TotalCorruptionDetected uint64 `json:"totalCorruptionDetected,omitempty"`
+
+	// Captures healed corruption count
+	TotalCorruptionHealed uint64 `json:"totalCorruptionHealed,omitempty"`
 }
 
 // CacheStats drive cache stats
@@ -510,6 +560,7 @@ type CacheStats struct {
 	N          int   `json:"n"`
 	Capacity   int64 `json:"cap"`
 	Used       int64 `json:"used"`
+	Entries    int64 `json:"entries"`
 	Hits       int64 `json:"hits"`
 	Misses     int64 `json:"misses"`
 	DelHits    int64 `json:"delHits"`
@@ -528,6 +579,7 @@ func (c *CacheStats) Merge(other *CacheStats) {
 	c.N += other.N
 	c.Capacity += other.Capacity
 	c.Used += other.Used
+	c.Entries += other.Entries
 	c.Hits += other.Hits
 	c.Misses += other.Misses
 	c.DelHits += other.DelHits
@@ -626,4 +678,51 @@ func (adm *AdminClient) ServerInfo(ctx context.Context, options ...func(*ServerI
 	}
 
 	return message, nil
+}
+
+// NewHostInfoStat creates a new HostInfoStat from a host.InfoStat.
+// If nil is passed, it will create a new host.InfoStat for current host.
+func NewHostInfoStat(src *host.InfoStat) *HostInfoStat {
+	if src == nil {
+		var err error
+		if src, err = host.InfoWithContext(context.Background()); err != nil {
+			return nil
+		}
+	}
+	dst := HostInfoStat(*src)
+	return &dst
+}
+
+// A HostInfoStat describes the host status.
+type HostInfoStat struct {
+	Hostname             string `json:"hostname,omitempty"`
+	Uptime               uint64 `json:"uptime,omitempty"`
+	BootTime             uint64 `json:"bootTime,omitempty"`
+	Procs                uint64 `json:"procs,omitempty"`           // number of processes
+	OS                   string `json:"os,omitempty"`              // ex: freebsd, linux
+	Platform             string `json:"platform,omitempty"`        // ex: ubuntu, linuxmint
+	PlatformFamily       string `json:"platformFamily,omitempty"`  // ex: debian, rhel
+	PlatformVersion      string `json:"platformVersion,omitempty"` // version of the complete OS
+	KernelVersion        string `json:"kernelVersion,omitempty"`   // version of the OS kernel (if available)
+	KernelArch           string `json:"kernelArch,omitempty"`      // native cpu architecture queried at runtime, as returned by `uname -m` or empty string in case of error
+	VirtualizationSystem string `json:"virtualizationSystem,omitempty"`
+	VirtualizationRole   string `json:"virtualizationRole,omitempty"` // guest or host
+	HostID               string `json:"hostId,omitempty"`             // ex: uuid
+}
+
+// CPU contains system's CPU information.
+type CPU struct {
+	VendorID           string   `json:"vendor_id,omitempty"`
+	Family             string   `json:"family,omitempty"`
+	Model              string   `json:"model,omitempty"`
+	Stepping           int32    `json:"stepping,omitempty"`
+	PhysicalID         string   `json:"physical_id,omitempty"`
+	ModelName          string   `json:"model_name,omitempty"`
+	Mhz                float64  `json:"mhz,omitempty"`
+	CacheSize          int32    `json:"cache_size,omitempty"`
+	Flags              []string `json:"flags,omitempty"`
+	Microcode          string   `json:"microcode,omitempty"`
+	Cores              int      `json:"cores,omitempty"`               // computed
+	MultithreadCapable *bool    `json:"multithread_capable,omitempty"` // CPU supports SMT (Intel HT/AMD SMT)
+	MultithreadEnabled *bool    `json:"multithread_enabled,omitempty"` // SMT currently active in OS
 }

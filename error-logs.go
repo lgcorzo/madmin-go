@@ -28,17 +28,39 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/minio/madmin-go/v4/log"
+	"github.com/lgcorzo/madmin-go/v4/log"
 	"github.com/tinylib/msgp/msgp"
 )
 
-// ErrorLogOpts represents the options for the ErrorLogs
+// ErrorLogOpts represents the options for the ErrorLogs.
+//
+// Wildcard syntax on Nodes / APIs / Buckets entries (case-insensitive):
+//
+//	"xyz"   → exact match
+//	"xyz*"  → prefix match
+//	"*xyz"  → suffix match
+//	"*xyz*" → contains match
+//	"*"     → matches anything
+//
+// Values within a single field OR-combine; across fields filters AND.
 type ErrorLogOpts struct {
-	Node     string        `json:"node,omitempty"`
-	API      string        `json:"api,omitempty"`
-	Bucket   string        `json:"bucket,omitempty"`
-	Prefix   string        `json:"prefix,omitempty"`
+	Nodes    []string      `json:"nodes,omitempty"`
+	APIs     []string      `json:"apis,omitempty"`
+	Buckets  []string      `json:"buckets,omitempty"`
+	Prefixes []string      `json:"prefixes,omitempty"`
 	Interval time.Duration `json:"interval,omitempty"`
+	Limit    int           `json:"limit,omitempty"`
+
+	// Deprecated: use Nodes.
+	Node string `json:"node,omitempty"`
+	// Deprecated: use APIs.
+	API string `json:"api,omitempty"`
+	// Deprecated: use Buckets.
+	Bucket string `json:"bucket,omitempty"`
+	// Deprecated: use Prefixes.
+	Prefix string `json:"prefix,omitempty"`
+	// Deprecated: use Limit.
+	MaxPerNode int `json:"maxPerNode,omitempty"`
 }
 
 // GetErrorLogs fetches the persisted error logs from MinIO
@@ -58,6 +80,7 @@ func (adm AdminClient) GetErrorLogs(ctx context.Context, opts ErrorLogOpts) iter
 			yield(log.Error{}, err)
 			return
 		}
+		defer closeResponse(resp)
 		if resp.StatusCode != http.StatusOK {
 			yield(log.Error{}, httpRespToErrorResponse(resp))
 			return
@@ -69,13 +92,16 @@ func (adm AdminClient) GetErrorLogs(ctx context.Context, opts ErrorLogOpts) iter
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				continue
+				yield(log.Error{}, err)
+				return
 			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				yield(info, nil)
+				if !yield(info, nil) {
+					return
+				}
 			}
 		}
 	}

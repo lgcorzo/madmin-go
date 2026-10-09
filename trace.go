@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-//go:generate stringer -type=TraceType -trimprefix=Trace $GOFILE
+//go:generate go tool stringer -type=TraceType -trimprefix=Trace $GOFILE
 
 // TraceType indicates the type of the tracing Info
 type TraceType uint64
@@ -76,6 +76,16 @@ const (
 	TraceIAM
 	// TraceTables will trace table operations
 	TraceTables
+	// TracePurgeOnDelete will trace purge-on-delete operations
+	TracePurgeOnDelete
+	// TraceTablesScan will trace catalog scanner operations which are for replica catalog rebuilding.
+	TraceTablesScan
+	// TraceSystemInventory will trace per-bucket system inventory operations.
+	TraceSystemInventory
+	// TraceTablesCompaction will trace table compaction operations.
+	TraceTablesCompaction
+	// TraceMemory will trace the AIStor Memory API functions.
+	TraceMemory
 	// Add more here...
 
 	// TraceAll contains all valid trace modes.
@@ -150,11 +160,12 @@ type TraceInfo struct {
 	Duration time.Duration `json:"dur"`
 	Bytes    int64         `json:"bytes,omitempty"`
 
-	Message    string            `json:"msg,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	Custom     map[string]string `json:"custom,omitempty"`
-	HTTP       *TraceHTTPStats   `json:"http,omitempty"`
-	HealResult *HealResultItem   `json:"healResult,omitempty"`
+	Message         string                  `json:"msg,omitempty"`
+	Error           string                  `json:"error,omitempty"`
+	Custom          map[string]string       `json:"custom,omitempty"`
+	HTTP            *TraceHTTPStats         `json:"http,omitempty"`
+	HealResult      *HealResultItem         `json:"healResult,omitempty"`
+	PurgeOnDeleteOp *TracePurgeOnDeleteInfo `json:"purgeOnDeleteOp,omitempty"`
 }
 
 // Mask returns the trace type as uint32.
@@ -170,11 +181,22 @@ type TraceHTTPStats struct {
 
 // TraceCallStats records request stats
 type TraceCallStats struct {
-	InputBytes      int           `json:"inputbytes"`
-	OutputBytes     int           `json:"outputbytes"`
+	InputBytes  int `json:"inputbytes,omitempty"`
+	OutputBytes int `json:"outputbytes,omitempty"`
+
+	// Time from resp read ends until first byte is sent.
+	// If the request had no payload this will be from request received to first response byte.
+	// If no response bytes were sent this will be time until response was done.
 	TimeToFirstByte time.Duration `json:"timetofirstbyte"`
-	ReadBlocked     time.Duration `json:"readBlocked"`
-	WriteBlocked    time.Duration `json:"writeBlocked"`
+
+	// Wall time of request and response read/write phase.
+	// Will be 0 if no bytes were read/written.
+	ReqReadTime   time.Duration `json:"reqReadTime,omitempty"`
+	RespWriteTime time.Duration `json:"respWriteTime,omitempty"`
+
+	// Time of request time blocked by upstream reads/writes
+	ReadBlocked  time.Duration `json:"readBlocked,omitempty"`
+	WriteBlocked time.Duration `json:"writeBlocked,omitempty"`
 }
 
 // TraceRequestInfo represents trace of http request
@@ -195,4 +217,34 @@ type TraceResponseInfo struct {
 	Headers    http.Header `json:"headers,omitempty"`
 	Body       []byte      `json:"body,omitempty"`
 	StatusCode int         `json:"statuscode,omitempty"`
+}
+
+// TracePurgeOnDeleteInfo represents information about purge-on-delete operations
+type TracePurgeOnDeleteInfo struct {
+	// Tracking metadata object information
+	TrackerBucket  string `json:"trackerBucket"`
+	TrackerObject  string `json:"trackerObject"`
+	TrackerVersion string `json:"trackerVersion"`
+
+	// Main namespace object information being tracked
+	SourceBucket  string `json:"sourceBucket"`            // Original bucket name
+	SourceObject  string `json:"sourceObject"`            // Original object name/prefix
+	SourceVersion string `json:"sourceVersion,omitempty"` // Original version ID if specific version
+
+	// Operation details
+	Operation       string `json:"operation"`                 // create, update, delete, cleanup, replicate
+	Status          string `json:"status"`                    // pending, in-progress, completed, failed
+	ReplicationSite string `json:"replicationSite,omitempty"` // Site name for cross-site replication
+}
+
+// NewTracePurgeOnDeleteInfo creates a new TracePurgeOnDeleteInfo with basic information
+func NewTracePurgeOnDeleteInfo(trackerBucket, trackerObject, trackerVersion string, sourceBucket, sourceObject string) *TracePurgeOnDeleteInfo {
+	return &TracePurgeOnDeleteInfo{
+		TrackerBucket:  trackerBucket,
+		TrackerObject:  trackerObject,
+		TrackerVersion: trackerVersion,
+		SourceBucket:   sourceBucket,
+		SourceObject:   sourceObject,
+		Status:         "pending",
+	}
 }

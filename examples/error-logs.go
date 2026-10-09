@@ -1,6 +1,5 @@
 //
 //go:build ignore
-// +build ignore
 
 //
 // Copyright (c) 2015-2022 MinIO, Inc.
@@ -28,7 +27,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 )
 
 func main() {

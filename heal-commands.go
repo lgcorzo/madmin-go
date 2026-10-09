@@ -31,7 +31,7 @@ import (
 )
 
 //msgp:tag json
-//go:generate msgp -d clearomitted -d "timezone utc" -file $GOFILE
+//go:generate go tool msgp -d clearomitted -d "timezone utc" -file $GOFILE
 
 // HealScanMode represents the type of healing scan
 type HealScanMode int
@@ -59,6 +59,7 @@ type HealOpts struct {
 	ScanMode     HealScanMode `json:"scanMode"`
 	UpdateParity bool         `json:"updateParity"` // Update the parity of the existing object with a new one
 	NoLock       bool         `json:"nolock"`
+	CrossPool    bool         `json:"crossPool"` // Check and fix crosspool objects.
 
 	// Pool to heal. nil indicates "all pools" (and sets).
 	Pool *int `json:"pool,omitempty"`
@@ -111,7 +112,7 @@ type HealTaskStatus struct {
 
 // HealItemType - specify the type of heal operation in a healing
 // result
-type HealItemType string
+type HealItemType = string
 
 // HealItemType constants
 const (
@@ -239,6 +240,17 @@ func (hri *HealResultItem) GetOnlineCounts() (b, a int) {
 	return b, a
 }
 
+// Healed - returns whether the item has been healed.
+// An item is considered healed when the number of online drives
+// after heal is greater than before heal.
+func (hri *HealResultItem) Healed() bool {
+	if hri == nil {
+		return false
+	}
+	before, after := hri.GetOnlineCounts()
+	return after > before
+}
+
 // Heal - API endpoint to start heal and to fetch status
 // forceStart and forceStop are mutually exclusive, you can either
 // set one of them to 'true'. If both are set 'forceStart' will be
@@ -352,7 +364,7 @@ type SetStatus struct {
 	Disks        []Disk `json:"disks"`
 }
 
-//go:generate stringer -type=HealingDriveReason -output=heal-commands-drive-reason_gen.go -trimprefix=HealingReason $GOFILE
+//go:generate go tool stringer -type=HealingDriveReason -output=heal-commands-drive-reason_gen.go -trimprefix=HealingReason $GOFILE
 type HealingDriveReason int8
 
 const (
@@ -362,7 +374,7 @@ const (
 	HealingReasonOfflineDisk
 )
 
-//go:generate stringer -type=OfflineReason -output=heal-commands-offline-reason_gen.go -trimprefix=OfflineReason $GOFILE
+//go:generate go tool stringer -type=OfflineReason -output=heal-commands-offline-reason_gen.go -trimprefix=OfflineReason $GOFILE
 type OfflineReason int8
 
 const (
@@ -373,7 +385,7 @@ const (
 	OfflineReasonDriveTimeout
 )
 
-//go:generate stringer -type=OfflineDecision -output=heal-commands-offline-decision_gen.go -trimprefix=OfflineDecision $GOFILE
+//go:generate go tool stringer -type=OfflineDecision -output=heal-commands-offline-decision_gen.go -trimprefix=OfflineDecision $GOFILE
 type OfflineDecision int8
 
 const (

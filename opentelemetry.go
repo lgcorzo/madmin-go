@@ -27,11 +27,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/minio/madmin-go/v4/estream"
+	"github.com/lgcorzo/madmin-go/v4/estream"
 )
 
 //msgp:replace TraceType with:uint64
-//go:generate msgp -d clearomitted -d "timezone utc" $GOFILE
+//go:generate go tool msgp -d clearomitted -d "timezone utc" $GOFILE
 
 // HTTPFilter defines parameters for filtering traces based on incoming http request properties
 type HTTPFilter struct {
@@ -87,7 +87,6 @@ func (adm AdminClient) ServiceTelemetryStream(ctx context.Context, opts ServiceT
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		closeResponse(resp)
 		return nil, httpRespToErrorResponse(resp)
 	}
 

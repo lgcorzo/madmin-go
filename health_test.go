@@ -22,8 +22,11 @@ package madmin
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // TestCPUFreqStatsJSONMarshal tests that only Name and Governor are included in JSON output when set
@@ -149,6 +152,62 @@ func ptr(val uint64) *uint64 {
 	return &val
 }
 
+// TestProductInfoJSONMarshal tests that empty DMI fields are dropped from
+// the JSON output via the omitempty tags.
+func TestProductInfoJSONMarshal(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    ProductInfo
+		expected string
+	}{
+		{
+			name: "Only addr set (no DMI — macOS / non-root / container)",
+			input: ProductInfo{
+				NodeCommon: NodeCommon{Addr: "node-1:9000"},
+			},
+			expected: `{"addr":"node-1:9000"}`,
+		},
+		{
+			name: "Fully populated (Linux + root)",
+			input: ProductInfo{
+				NodeCommon:   NodeCommon{Addr: "node-1:9000"},
+				Family:       "PowerEdge",
+				Name:         "PowerEdge R750",
+				Vendor:       "Dell Inc.",
+				SerialNumber: "5XYZ123",
+				UUID:         "4c4c4544-0058-5910-8050-cac04f445232",
+				SKU:          "SKU=PE-R750",
+				Version:      "2.10.0",
+			},
+			expected: `{"addr":"node-1:9000","family":"PowerEdge","name":"PowerEdge R750","vendor":"Dell Inc.","serial_number":"5XYZ123","uuid":"4c4c4544-0058-5910-8050-cac04f445232","sku":"SKU=PE-R750","version":"2.10.0"}`,
+		},
+		{
+			name: "Partial (non-root Linux: serial/uuid restricted)",
+			input: ProductInfo{
+				NodeCommon: NodeCommon{Addr: "node-1:9000"},
+				Family:     "PowerEdge",
+				Name:       "PowerEdge R750",
+				Vendor:     "Dell Inc.",
+				SKU:        "SKU=PE-R750",
+				Version:    "2.10.0",
+			},
+			expected: `{"addr":"node-1:9000","family":"PowerEdge","name":"PowerEdge R750","vendor":"Dell Inc.","sku":"SKU=PE-R750","version":"2.10.0"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, err := json.Marshal(tt.input)
+			if err != nil {
+				t.Fatalf("Failed to marshal JSON: %v", err)
+			}
+			if string(output) != tt.expected {
+				t.Errorf("Expected JSON: %s, got: %s", tt.expected, string(output))
+			}
+		})
+	}
+}
+
 // TestCPUMultithreadingDetection tests actual CPU detection on the running system
 func TestCPUMultithreadingDetection(t *testing.T) {
 	cpusInfo := GetCPUs(context.TODO(), "test-addr")
@@ -218,5 +277,53 @@ func TestCPUMultithreadingDetection(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestServerHealthInfoPreservesBufferedFrames verifies the version probe does
+// not swallow the frames behind it. The probe's decoder reads ahead, so when
+// the server emits several frames into one flush the bytes after the version
+// frame land in that decoder's buffer. Callers decode the rest of the stream
+// from resp.Body with a decoder of their own, and would otherwise pick up a
+// frame whose prefix is already gone.
+func TestServerHealthInfoPreservesBufferedFrames(t *testing.T) {
+	frame := func(ts time.Time) []byte {
+		b, err := json.Marshal(HealthInfo{Version: HealthInfoVersion, TimeStamp: ts})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		return b
+	}
+	first, second := time.Unix(500, 0).UTC(), time.Unix(1000, 0).UTC()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Both frames in a single write, so they reach the client in one read.
+		_, _ = w.Write(append(frame(first), frame(second)...))
+	}))
+	defer server.Close()
+
+	client, err := New(mustParseHost(t, server.URL), "ak", "sk", false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	resp, version, err := client.ServerHealthInfo(context.Background(),
+		[]HealthDataType{HealthDataTypeMinioInfo}, time.Second, "")
+	if err != nil {
+		t.Fatalf("ServerHealthInfo: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if version != HealthInfoVersion {
+		t.Errorf("version = %q, want %q", version, HealthInfoVersion)
+	}
+
+	var got HealthInfo
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding the frame after the version probe: %v", err)
+	}
+	if !got.TimeStamp.Equal(second) {
+		t.Errorf("TimeStamp = %v, want the frame after the probe (%v)", got.TimeStamp, second)
 	}
 }

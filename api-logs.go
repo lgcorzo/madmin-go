@@ -28,20 +28,33 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/minio/madmin-go/v4/log"
+	"github.com/lgcorzo/madmin-go/v4/log"
 	"github.com/tinylib/msgp/msgp"
 )
 
-// APILogOpts represents the options for the APILogOpts
+// APILogOpts represents the options for fetching API logs.
+//
+// Wildcard syntax on Nodes / APIs / Buckets entries (case-insensitive):
+//
+//	"xyz"   → exact match
+//	"xyz*"  → prefix match
+//	"*xyz"  → suffix match
+//	"*xyz*" → contains match
+//	"*"     → matches anything
+//
+// Values within a single field OR-combine; across fields filters AND.
 type APILogOpts struct {
-	Node       string        `json:"node,omitempty"`
-	API        string        `json:"api,omitempty"`
-	Bucket     string        `json:"bucket,omitempty"`
-	Prefix     string        `json:"prefix,omitempty"`
-	StatusCode int           `json:"statusCode,omitempty"`
-	Interval   time.Duration `json:"interval,omitempty"`
-	Origin     log.Origin    `json:"origin,omitempty"`
-	Type       log.APIType   `json:"type,omitempty"`
+	Nodes        []string      `json:"nodes,omitempty"`
+	APIs         []string      `json:"apis,omitempty"`
+	Buckets      []string      `json:"buckets,omitempty"`
+	Prefix       string        `json:"prefix,omitempty"`
+	StatusCodes  []int         `json:"statusCodes,omitempty"`
+	StatusRanges []string      `json:"statusRanges,omitempty"` // e.g. "2xx", "4xx", "5xx"
+	Interval     time.Duration `json:"interval,omitempty"`
+	Origins      []log.Origin  `json:"origins,omitempty"`
+	Types        []log.APIType `json:"types,omitempty"`
+	MaxPerNode   int           `json:"maxPerNode,omitempty"` // Deprecated
+	Limit        int           `json:"limit,omitempty"`
 }
 
 // GetAPILogs fetches the persisted API logs from MinIO
@@ -61,6 +74,7 @@ func (adm AdminClient) GetAPILogs(ctx context.Context, opts APILogOpts) iter.Seq
 			yield(log.API{}, err)
 			return
 		}
+		defer closeResponse(resp)
 		if resp.StatusCode != http.StatusOK {
 			yield(log.API{}, httpRespToErrorResponse(resp))
 			return
@@ -72,13 +86,16 @@ func (adm AdminClient) GetAPILogs(ctx context.Context, opts APILogOpts) iter.Seq
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				continue
+				yield(log.API{}, err)
+				return
 			}
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				yield(info, nil)
+				if !yield(info, nil) {
+					return
+				}
 			}
 		}
 	}

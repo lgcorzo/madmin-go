@@ -3,7 +3,7 @@
 package log
 
 import (
-	"github.com/minio/madmin-go/v4"
+	"github.com/lgcorzo/madmin-go/v4"
 	"github.com/tinylib/msgp/msgp"
 )
 

@@ -19,7 +19,7 @@
 
 package estream
 
-//go:generate stringer -type=blockID -trimprefix=block
+//go:generate go tool stringer -type=blockID -trimprefix=block
 
 type blockID int8
 
@@ -32,15 +32,18 @@ const (
 	blockEOS
 	blockEOF
 	blockError
+	blockPlainCompressedStream
+	blockEncCompressedStream
 )
 
 type checksumType uint8
 
-//go:generate stringer -type=checksumType -trimprefix=checksumType
+//go:generate go tool stringer -type=checksumType -trimprefix=checksumType
 
 const (
 	checksumTypeNone checksumType = iota
 	checksumTypeXxhash
+	checksumTypeXxhash3
 
 	checksumTypeUnknown
 )

@@ -174,7 +174,10 @@ type PeerInfo struct {
 	DefaultBandwidth   BucketBandwidth `json:"defaultbandwidth"` // bandwidth limit per bucket in bytes/sec
 	ReplicateILMExpiry bool            `json:"replicate-ilm-expiry"`
 	ObjectNamingMode   string          `json:"objectNamingMode,omitempty"`
-	APIVersion         string          `json:"apiVersion,omitempty"`
+	// TablesReplicaEnabled is true when this peer has the catalog scanner
+	// enabled (i.e. is acting as a tables replica site).
+	TablesReplicaEnabled bool   `json:"tablesReplicaEnabled,omitempty"`
+	APIVersion           string `json:"apiVersion,omitempty"`
 }
 
 // BucketBandwidth has default bandwidth limit per bucket in bytes/sec
@@ -235,6 +238,16 @@ type BktOp string
 const (
 	// make bucket and enable versioning
 	MakeWithVersioningBktOp BktOp = "make-with-versioning"
+	// make an AIStor Tables warehouse bucket and enable versioning; a peer that
+	// predates warehouse replication has no route for this op and rejects it, so
+	// the warehouse is withheld until that peer is upgraded
+	MakeWarehouseBktOp BktOp = "make-warehouse"
+	// make an AIStor Memory cortex bucket and enable versioning. A cortex is
+	// always also a Tables warehouse (a super-bucket), so this op implies the
+	// warehouse capability too. A peer that predates cortex replication has no
+	// route for this op and rejects it, so the cortex is withheld until that peer
+	// is upgraded.
+	MakeCortexBktOp BktOp = "make-cortex"
 	// add replication configuration
 	ConfigureReplBktOp BktOp = "configure-replication"
 	// delete bucket (forceDelete = off)
@@ -252,7 +265,7 @@ func (adm *AdminClient) SRPeerBucketOps(ctx context.Context, bucket string, op B
 	v.Add("operation", string(op))
 
 	// For make-bucket, bucket options may be sent via `opts`
-	if op == MakeWithVersioningBktOp || op == DeleteBucketBktOp {
+	if op == MakeWithVersioningBktOp || op == MakeWarehouseBktOp || op == MakeCortexBktOp || op == DeleteBucketBktOp {
 		for k, val := range opts {
 			v.Add(k, val)
 		}
@@ -288,6 +301,7 @@ const (
 	SRIAMItemSTSAcc        = "sts-account"
 	SRIAMItemIAMUser       = "iam-user"
 	SRIAMItemExternalUser  = "external-user"
+	SRIAMItemLDAPUser      = "ldap-user"
 )
 
 // SRSessionPolicy - represents a session policy to be replicated.
@@ -356,6 +370,8 @@ type SRPolicyMapping struct {
 	UserType    int       `json:"userType"`
 	IsGroup     bool      `json:"isGroup"`
 	Policy      string    `json:"policy"`
+	Provider    string    `json:"provider,omitempty"`
+	ConfigID    string    `json:"configID,omitempty"`
 	CreatedAt   time.Time `json:"createdAt,omitempty"`
 	UpdatedAt   time.Time `json:"updatedAt,omitempty"`
 	APIVersion  string    `json:"apiVersion,omitempty"`
@@ -392,6 +408,19 @@ type SRExternalUser struct {
 	OpenIDUser *OpenIDUser `json:"openIDUser,omitempty"`
 }
 
+// SRLDAPUser - represents an LDAP user to be replicated.
+type SRLDAPUser struct {
+	DN          string    `json:"dn"`
+	Username    string    `json:"username"`
+	ValidatedDN string    `json:"validatedDN,omitempty"`
+	Groups      []string  `json:"groups,omitempty"`
+	Expiry      time.Time `json:"expiry,omitempty"`
+	IsDeleteReq bool      `json:"isDeleteReq"`
+	ConfigName  string    `json:"configName"`
+	UpdatedAt   time.Time `json:"updatedAt,omitempty"`
+	APIVersion  string    `json:"apiVersion,omitempty"`
+}
+
 // SRIAMUser - represents a regular (IAM) user to be replicated. A nil UserReq
 // implies that a user delete operation should be replicated on the peer cluster.
 type SRIAMUser struct {
@@ -413,12 +442,12 @@ type SRGroupInfo struct {
 type SRCredInfo struct {
 	AccessKey string `json:"accessKey"`
 
-	// This type corresponds to github.com/minio/minio/cmd.IAMUserType
+	// This type corresponds to github.com/lgcorzo/minio/cmd.IAMUserType
 	IAMUserType int `json:"iamUserType"`
 
 	IsDeleteReq bool `json:"isDeleteReq,omitempty"`
 
-	// This is the JSON encoded value of github.com/minio/minio/cmd.UserIdentity
+	// This is the JSON encoded value of github.com/lgcorzo/minio/cmd.UserIdentity
 	UserIdentityJSON json.RawMessage `json:"userIdentityJSON"`
 	APIVersion       string          `json:"apiVersion,omitempty"`
 }
@@ -451,6 +480,9 @@ type SRIAMItem struct {
 
 	// Used when Type = SRIAMItemExternalUser
 	ExternalUser *SRExternalUser `json:"externalUser"`
+
+	// Used when Type = SRIAMItemLDAPUser
+	LDAPUser *SRLDAPUser `json:"ldapUser"`
 
 	// UpdatedAt - timestamp of last update
 	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
@@ -638,8 +670,9 @@ type OpenIDSettings struct {
 // IDPSettings contains key IDentity Provider settings to validate that all
 // peers have the same configuration.
 type IDPSettings struct {
-	LDAP   LDAPSettings
-	OpenID OpenIDSettings
+	LDAP        LDAPSettings
+	LDAPConfigs LDAPConfigSettings
+	OpenID      OpenIDSettings
 }
 
 // LDAPSettings contains LDAP configuration info of a cluster.
@@ -649,6 +682,19 @@ type LDAPSettings struct {
 	LDAPUserDNSearchFilter string
 	LDAPGroupSearchBase    string
 	LDAPGroupSearchFilter  string
+}
+
+type LDAPProviderSettings struct {
+	UserDNSearchBase   string
+	UserDNSearchFilter string
+	GroupSearchBase    string
+	GroupSearchFilter  string
+}
+
+// LDAPConfigSettings contains LDAP configuration info of all providers in a cluster.
+type LDAPConfigSettings struct {
+	Enabled bool
+	Configs map[string]LDAPProviderSettings
 }
 
 // SRPeerGetIDPSettings - fetches IDP settings from the server.
@@ -718,6 +764,11 @@ type SRInfo struct {
 	ILMExpiryRules map[string]ILMExpiryRule      // map of ILM Expiry rule to content
 	State          SRStateInfo                   // peer state
 	APIVersion     string                        `json:"apiVersion,omitempty"`
+
+	// TablesReplicaEnabled reports whether the site runs the AIStor Tables
+	// replica catalog. Absent from peers that predate the field, which decode
+	// it as false.
+	TablesReplicaEnabled bool `json:"tablesReplicaEnabled,omitempty"`
 }
 
 // SRMetaInfo - returns replication metadata info for a site.
@@ -1323,7 +1374,26 @@ type SRMetricsSummary struct {
 	Retries Counter `json:"retries"`
 	// represents the error count
 	Errors Counter `json:"errors"`
+	// Aggregate windowed replicated stats (outbound to all site peers).
+	//
+	// Deprecated: this cluster-level rollup is retained for backward
+	// compatibility during rolling upgrades. Prefer ReplicatedByDeployment
+	// for per-peer data; this field will be removed in a future release.
+	Replicated ReplicationWindowedStats `json:"replicated"`
+	// Aggregate windowed received stats (inbound from all site peers).
+	Received ReplicationWindowedStats `json:"received"`
+	// Per-deployment windowed replicated stats, keyed by deployment ID.
+	ReplicatedByDeployment map[string]ReplicationWindowedStats `json:"replicatedByDeployment,omitempty"`
+	// Per-deployment windowed failed/error stats, keyed by deployment ID.
+	FailedByDeployment    map[string]ReplicationWindowedStats            `json:"failedByDeployment,omitempty"`
+	ReceivedByBucket      map[string]ReplicationWindowedStats            `json:"receivedByBucket,omitempty"`
+	ReplicatedByBucketArn map[string]map[string]ReplicationWindowedStats `json:"replicatedByBucketArn,omitempty"`
+	FailedByBucketArn     map[string]map[string]ReplicationWindowedStats `json:"failedByBucketArn,omitempty"`
 }
+
+// ReplicationWindowedStats holds count and bytes across time windows for
+// replication data transfer (both inbound and outbound).
+type ReplicationWindowedStats = ReplicationReceivedStats
 
 // Counter denotes the counts
 type Counter struct {

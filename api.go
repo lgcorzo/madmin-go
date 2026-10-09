@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2015-2024 MinIO, Inc.
+// Copyright (c) 2015-2026 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -206,6 +206,10 @@ type requestData struct {
 	endpointOverride *url.URL
 	// isKMS replaces URL prefix with /kms
 	isKMS bool
+	// creds, when set, signs every attempt instead of a fresh lookup. A caller
+	// that encrypted content with a credential sets it, so the body and the
+	// signature always use the same secret.
+	creds *credentials.Value
 }
 
 // Filter out signature value from Authorization header.
@@ -228,7 +232,7 @@ func (adm AdminClient) filterSignature(req *http.Request) {
 }
 
 // dumpHTTP - dump HTTP request and response.
-func (adm AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
+func (adm AdminClient) dumpHTTP(req *http.Request, resp *http.Response, netErr error) error {
 	// Starts http dump.
 	_, err := fmt.Fprintln(adm.traceOutput, "---------START-HTTP---------")
 	if err != nil {
@@ -250,40 +254,56 @@ func (adm AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
 		return err
 	}
 
-	// Only display response header.
-	var respTrace []byte
-
-	// For errors we make sure to dump response body as well.
-	if resp.StatusCode != http.StatusOK &&
-		resp.StatusCode != http.StatusPartialContent &&
-		resp.StatusCode != http.StatusNoContent {
-		respTrace, err = httputil.DumpResponse(resp, true)
+	// If there was a network error, dump the error instead of response
+	if netErr != nil {
+		_, err = fmt.Fprintln(adm.traceOutput, "\n[NETWORK ERROR]")
 		if err != nil {
 			return err
 		}
-	} else {
-		// WORKAROUND for https://github.com/golang/go/issues/13942.
-		// httputil.DumpResponse does not print response headers for
-		// all successful calls which have response ContentLength set
-		// to zero. Keep this workaround until the above bug is fixed.
-		if resp.ContentLength == 0 {
-			var buffer bytes.Buffer
-			if err = resp.Header.Write(&buffer); err != nil {
-				return err
-			}
-			respTrace = buffer.Bytes()
-			respTrace = append(respTrace, []byte("\r\n")...)
-		} else {
-			respTrace, err = httputil.DumpResponse(resp, false)
+		_, err = fmt.Fprintln(adm.traceOutput, "Note: Request was attempted but may not have been received by the server.")
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(adm.traceOutput, "Error: %v\n", netErr)
+		if err != nil {
+			return err
+		}
+	} else if resp != nil {
+		// Only display response header.
+		var respTrace []byte
+
+		// For errors we make sure to dump response body as well.
+		if resp.StatusCode != http.StatusOK &&
+			resp.StatusCode != http.StatusPartialContent &&
+			resp.StatusCode != http.StatusNoContent {
+			respTrace, err = httputil.DumpResponse(resp, true)
 			if err != nil {
 				return err
 			}
+		} else {
+			// WORKAROUND for https://github.com/golang/go/issues/13942.
+			// httputil.DumpResponse does not print response headers for
+			// all successful calls which have response ContentLength set
+			// to zero. Keep this workaround until the above bug is fixed.
+			if resp.ContentLength == 0 {
+				var buffer bytes.Buffer
+				if err = resp.Header.Write(&buffer); err != nil {
+					return err
+				}
+				respTrace = buffer.Bytes()
+				respTrace = append(respTrace, []byte("\r\n")...)
+			} else {
+				respTrace, err = httputil.DumpResponse(resp, false)
+				if err != nil {
+					return err
+				}
+			}
 		}
-	}
-	// Write response to trace output.
-	_, err = fmt.Fprint(adm.traceOutput, strings.TrimSuffix(string(respTrace), "\r\n"))
-	if err != nil {
-		return err
+		// Write response to trace output.
+		_, err = fmt.Fprint(adm.traceOutput, strings.TrimSuffix(string(respTrace), "\r\n"))
+		if err != nil {
+			return err
+		}
 	}
 
 	// Ends the http dump.
@@ -295,6 +315,13 @@ func (adm AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
 func (adm AdminClient) do(req *http.Request) (*http.Response, error) {
 	resp, err := adm.httpClient.Do(req)
 	if err != nil {
+		// If trace is enabled, dump http request and error.
+		if adm.isTraceEnabled {
+			dumpErr := adm.dumpHTTP(req, nil, err)
+			if dumpErr != nil {
+				return nil, dumpErr
+			}
+		}
 		// Handle this specifically for now until future Golang versions fix this issue properly.
 		if urlErr, ok := err.(*url.Error); ok {
 			if strings.Contains(urlErr.Err.Error(), "EOF") {
@@ -316,7 +343,7 @@ func (adm AdminClient) do(req *http.Request) (*http.Response, error) {
 
 	// If trace is enabled, dump http request and response.
 	if adm.isTraceEnabled {
-		err = adm.dumpHTTP(req, resp)
+		err = adm.dumpHTTP(req, resp, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -337,6 +364,7 @@ type RequestData struct {
 	QueryValues   url.Values
 	RelPath       string // URL path relative to admin API base endpoint
 	Content       []byte
+	IsKMS         bool
 }
 
 // ExecuteMethod - similar to internal method executeMethod() useful
@@ -347,6 +375,7 @@ func (adm AdminClient) ExecuteMethod(ctx context.Context, method string, reqData
 		queryValues:   reqData.QueryValues,
 		relPath:       reqData.RelPath,
 		content:       reqData.Content,
+		isKMS:         reqData.IsKMS,
 	})
 }
 
@@ -398,9 +427,19 @@ func (adm AdminClient) executeMethod(ctx context.Context, method string, reqData
 			}
 		}
 
-		if res.StatusCode == http.StatusUpgradeRequired {
-			reqData.relPath = strings.ReplaceAll(reqData.relPath, adminAPIPrefix, adminAPIOldPrefix)
-			continue // Retry when an upgrade is requested.
+		// Retry on the previous admin API version when an upgrade is requested.
+		// Only a path that starts with the current version is rewritten, and
+		// only when an older version exists. Any other path gets the 426 as its
+		// error. The body stays readable, because this can be the last attempt,
+		// and the caller then decodes the 426 error from it.
+		if res.StatusCode == http.StatusUpgradeRequired && adminAPIPrefix != adminAPIOldPrefix {
+			if rest, ok := strings.CutPrefix(reqData.relPath, adminAPIPrefix); ok {
+				body, _ := io.ReadAll(res.Body)
+				closeResponse(res)
+				res.Body = io.NopCloser(bytes.NewReader(body))
+				reqData.relPath = adminAPIOldPrefix + rest
+				continue
+			}
 		}
 
 		// Read the body to be saved later.
@@ -497,8 +536,10 @@ func (adm AdminClient) newRequest(ctx context.Context, method string, reqData re
 		return nil, err
 	}
 
-	value, err := adm.credsProvider.GetWithContext(adm.CredContext())
-	if err != nil {
+	var value credentials.Value
+	if reqData.creds != nil {
+		value = *reqData.creds
+	} else if value, err = adm.credsProvider.GetWithContext(adm.CredContext()); err != nil {
 		return nil, err
 	}
 

@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -37,8 +38,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/minio/madmin-go/v4/cgroup"
-	"github.com/minio/madmin-go/v4/kernel"
+	"github.com/lgcorzo/madmin-go/v4/cgroup"
+	"github.com/lgcorzo/madmin-go/v4/kernel"
 	"github.com/prometheus/procfs"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
@@ -134,25 +135,6 @@ type SysService struct {
 	Status string `json:"status"`
 }
 
-// CPU contains system's CPU information.
-//
-//msgp:ignore CPU
-type CPU struct {
-	VendorID           string   `json:"vendor_id"`
-	Family             string   `json:"family"`
-	Model              string   `json:"model"`
-	Stepping           int32    `json:"stepping"`
-	PhysicalID         string   `json:"physical_id"`
-	ModelName          string   `json:"model_name"`
-	Mhz                float64  `json:"mhz"`
-	CacheSize          int32    `json:"cache_size"`
-	Flags              []string `json:"flags"`
-	Microcode          string   `json:"microcode"`
-	Cores              int      `json:"cores"`                         // computed
-	MultithreadCapable *bool    `json:"multithread_capable,omitempty"` // CPU supports SMT (Intel HT/AMD SMT)
-	MultithreadEnabled *bool    `json:"multithread_enabled,omitempty"` // SMT currently active in OS
-}
-
 // CPUs contains all CPU information of a node.
 type CPUs struct {
 	NodeCommon
@@ -180,6 +162,85 @@ type CPUFreqStats struct {
 	SetSpeed                 string  `json:",omitempty"`
 }
 
+// AddCPUs adds CPU information from CPUs struct to CPUMetrics aggregated data.
+// This follows the merge rules where metrics are accumulated in an order-independent way.
+func (c *CPUs) AddCPUs(m *CPUMetrics) {
+	if c == nil || m == nil {
+		return
+	}
+
+	// Process CPU information
+	for _, cpu := range c.CPUs {
+		// Accumulate model name counts
+		if cpu.ModelName != "" {
+			if m.CPUByModel == nil {
+				m.CPUByModel = make(map[string]int)
+			}
+			m.CPUByModel[strings.TrimSpace(cpu.ModelName)]++
+		}
+
+		// Accumulate MHz
+		m.TotalMhz += cpu.Mhz
+
+		// Accumulate cores
+		m.TotalCores += cpu.Cores
+
+		// Accumulate cache size (converting from int32 KB to int64 bytes)
+		m.TotalCacheSize += int64(cpu.CacheSize) * 1024
+
+		// Count CPU entries
+		m.CPUCount++
+	}
+
+	// Process CPU frequency stats
+	for _, freq := range c.CPUFreqStats {
+		// Count governors
+		if freq.Governor != "" {
+			if m.GovernorFreq == nil {
+				m.GovernorFreq = make(map[string]int)
+			}
+			m.GovernorFreq[strings.TrimSpace(freq.Governor)]++
+		}
+
+		// Accumulate current frequencies
+		if freq.CpuinfoCurrentFrequency != nil {
+			m.TotalCurrentFreq += *freq.CpuinfoCurrentFrequency
+		}
+		if freq.ScalingCurrentFrequency != nil {
+			m.TotalScalingCurrentFreq += *freq.ScalingCurrentFrequency
+		}
+
+		// Handle min/max frequencies with proper initialization
+		// Use FreqStatsCount to determine if this is the first frequency stat
+		if freq.CpuinfoMinimumFrequency != nil {
+			if m.FreqStatsCount == 0 || *freq.CpuinfoMinimumFrequency < m.MinCPUInfoFreq {
+				m.MinCPUInfoFreq = *freq.CpuinfoMinimumFrequency
+			}
+		}
+
+		if freq.CpuinfoMaximumFrequency != nil {
+			if *freq.CpuinfoMaximumFrequency > m.MaxCPUInfoFreq {
+				m.MaxCPUInfoFreq = *freq.CpuinfoMaximumFrequency
+			}
+		}
+
+		if freq.ScalingMinimumFrequency != nil {
+			if m.FreqStatsCount == 0 || *freq.ScalingMinimumFrequency < m.MinScalingFreq {
+				m.MinScalingFreq = *freq.ScalingMinimumFrequency
+			}
+		}
+
+		if freq.ScalingMaximumFrequency != nil {
+			if *freq.ScalingMaximumFrequency > m.MaxScalingFreq {
+				m.MaxScalingFreq = *freq.ScalingMaximumFrequency
+			}
+		}
+
+		// Count frequency stats entries
+		m.FreqStatsCount++
+	}
+}
+
 // GetCPUs returns system's all CPU information.
 func GetCPUs(ctx context.Context, addr string) CPUs {
 	infos, err := cpu.InfoWithContext(ctx)
@@ -202,10 +263,8 @@ func GetCPUs(ctx context.Context, addr string) CPUs {
 	cpuMap := map[string]CPU{}
 	for _, info := range infos {
 		cpu, found := cpuMap[info.PhysicalID]
-		if found {
-			cpu.Cores++
-		} else {
-			cpuMap[info.PhysicalID] = CPU{
+		if !found {
+			cpu = CPU{
 				VendorID:           info.VendorID,
 				Family:             info.Family,
 				Model:              info.Model,
@@ -216,11 +275,12 @@ func GetCPUs(ctx context.Context, addr string) CPUs {
 				CacheSize:          info.CacheSize,
 				Flags:              info.Flags,
 				Microcode:          info.Microcode,
-				Cores:              1,
 				MultithreadCapable: mtCapable,
 				MultithreadEnabled: mtEnabled,
 			}
 		}
+		cpu.Cores += int(info.Cores)
+		cpuMap[info.PhysicalID] = cpu
 	}
 
 	cpus := []CPU{}
@@ -323,6 +383,7 @@ type Partition struct {
 	SpaceFree    uint64 `json:"space_free,omitempty"`
 	InodeTotal   uint64 `json:"inode_total,omitempty"`
 	InodeFree    uint64 `json:"inode_free,omitempty"`
+	FstabSource  string `json:"fstab_source,omitempty"` // source from /etc/fstab (UUID=, LABEL=, or device path)
 }
 
 // NetSettings - rx/tx settings of an interface
@@ -343,7 +404,9 @@ type NetInfo struct {
 	NodeCommon
 	Interface       string       `json:"interface,omitempty"`
 	Driver          string       `json:"driver,omitempty"`
+	DriverVersion   string       `json:"driver_version,omitempty"`
 	FirmwareVersion string       `json:"firmware_version,omitempty"`
+	BusInfo         string       `json:"bus_info,omitempty"`
 	Settings        *NetSettings `json:"settings,omitempty"`
 }
 
@@ -416,6 +479,41 @@ func getDriveHwInfo(partDevice string) (info driveHwInfo, err error) {
 	return info, err
 }
 
+// parseFstab reads /etc/fstab and returns a map of mountpoint to source device specification.
+// The source can be a device path (/dev/sdb1), UUID (UUID=xxx), or LABEL (LABEL=xxx).
+func parseFstab() map[string]string {
+	result := make(map[string]string)
+
+	file, err := os.Open("/etc/fstab")
+	if err != nil {
+		return result
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// fstab format: <source> <mountpoint> <type> <options> <dump> <pass>
+		// Fields are separated by whitespace (spaces or tabs)
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		source := fields[0]
+		mountpoint := fields[1]
+		result[mountpoint] = source
+	}
+
+	return result
+}
+
 // GetPartitions returns all disk partitions information of a node running linux only operating system.
 func GetPartitions(ctx context.Context, addr string) Partitions {
 	if runtime.GOOS != "linux" {
@@ -438,6 +536,9 @@ func GetPartitions(ctx context.Context, addr string) Partitions {
 	}
 
 	partitions := []Partition{}
+
+	// Parse /etc/fstab once to look up mount sources
+	fstabEntries := parseFstab()
 
 	for i := range parts {
 		usage, err := disk.UsageWithContext(ctx, parts[i].Mountpoint)
@@ -468,6 +569,7 @@ func GetPartitions(ctx context.Context, addr string) Partitions {
 				Revision:     di.Revision,
 				Major:        di.Major,
 				Minor:        di.Minor,
+				FstabSource:  fstabEntries[parts[i].Mountpoint],
 			})
 		}
 	}
@@ -484,6 +586,51 @@ type OSInfo struct {
 
 	Info    host.InfoStat             `json:"info,omitempty"`
 	Sensors []sensors.TemperatureStat `json:"sensors,omitempty"`
+}
+
+// AddOSInfo adds OS information including sensors to OSMetrics aggregated data.
+// This follows the merge rules where metrics are accumulated in an order-independent way.
+func (o *OSInfo) AddOSInfo(m *OSMetrics) {
+	if o == nil || m == nil {
+		return
+	}
+
+	// Process sensor information
+	if len(o.Sensors) > 0 {
+		if m.Sensors == nil {
+			m.Sensors = make(map[string]SensorMetrics)
+		}
+
+		for _, sensor := range o.Sensors {
+			existing := m.Sensors[sensor.SensorKey]
+
+			// Initialize or update min/max
+			if existing.Count == 0 {
+				// First reading for this sensor
+				existing.MinTemp = sensor.Temperature
+				existing.MaxTemp = sensor.Temperature
+			} else {
+				if sensor.Temperature < existing.MinTemp {
+					existing.MinTemp = sensor.Temperature
+				}
+				if sensor.Temperature > existing.MaxTemp {
+					existing.MaxTemp = sensor.Temperature
+				}
+			}
+
+			// Accumulate total for averaging
+			existing.TotalTemp += sensor.Temperature
+			existing.Count++
+
+			// Check if temperature exceeds critical threshold
+			// Only count if Critical is non-zero (valid threshold)
+			if sensor.Critical > 0 && sensor.Temperature > sensor.Critical {
+				existing.ExceedsCritical++
+			}
+
+			m.Sensors[sensor.SensorKey] = existing
+		}
+	}
 }
 
 // TimeInfo contains current time with timezone, and
@@ -508,42 +655,23 @@ type XFSErrorConfig struct {
 
 // GetOSInfo returns linux only operating system's information.
 func GetOSInfo(ctx context.Context, addr string) OSInfo {
-	if runtime.GOOS != "linux" {
-		return OSInfo{
-			NodeCommon: NodeCommon{
-				Addr:  addr,
-				Error: "unsupported operating system " + runtime.GOOS,
-			},
-		}
+	osInfo := OSInfo{
+		NodeCommon: NodeCommon{Addr: addr},
 	}
+	osInfo.Sensors, _ = sensors.TemperaturesWithContext(ctx)
 
 	kr, err := kernel.CurrentRelease()
 	if err != nil {
-		return OSInfo{
-			NodeCommon: NodeCommon{
-				Addr:  addr,
-				Error: err.Error(),
-			},
-		}
+		osInfo.Error += fmt.Sprintf("[kernel.CurrentRelease: %q]", err.Error())
 	}
 
 	info, err := host.InfoWithContext(ctx)
 	if err != nil {
-		return OSInfo{
-			NodeCommon: NodeCommon{
-				Addr:  addr,
-				Error: err.Error(),
-			},
-		}
+		osInfo.Error += fmt.Sprintf("[host.Info: %q]", err.Error())
+	} else {
+		info.KernelVersion = kr
+		osInfo.Info = *info
 	}
-
-	osInfo := OSInfo{
-		NodeCommon: NodeCommon{Addr: addr},
-		Info:       *info,
-	}
-	osInfo.Info.KernelVersion = kr
-
-	osInfo.Sensors, _ = sensors.TemperaturesWithContext(ctx)
 
 	return osInfo
 }
@@ -668,19 +796,19 @@ func getXFSErrorMaxRetries() XFSErrorConfigs {
 type ProductInfo struct {
 	NodeCommon
 
-	Family       string `json:"family"`
-	Name         string `json:"name"`
-	Vendor       string `json:"vendor"`
-	SerialNumber string `json:"serial_number"`
-	UUID         string `json:"uuid"`
-	SKU          string `json:"sku"`
-	Version      string `json:"version"`
+	Family       string `json:"family,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Vendor       string `json:"vendor,omitempty"`
+	SerialNumber string `json:"serial_number,omitempty"`
+	UUID         string `json:"uuid,omitempty"`
+	SKU          string `json:"sku,omitempty"`
+	Version      string `json:"version,omitempty"`
 }
 
 func getDMIInfo(ask string) string {
 	value, err := os.ReadFile(path.Join(sysClassDMI, "id", ask))
 	if err != nil {
-		return "unknown"
+		return ""
 	}
 	return strings.TrimSpace(string(value))
 }
@@ -887,6 +1015,13 @@ type ProcInfo struct {
 	Times          cpu.TimesStat              `json:"times,omitempty"`
 	UIDs           []int32                    `json:"uids,omitempty"`
 	Username       string                     `json:"username,omitempty"`
+
+	// DStateThreads is the per-process snapshot of threads currently in
+	// uninterruptible disk sleep (D), captured for `mc support diag`.
+	// Populated only when the diag collector finds threads in D and the
+	// node has dwell history; nil otherwise (e.g. realtime ProcInfo
+	// callers that don't request thread diagnostics).
+	DStateThreads *DStateThreadsDiag `json:"dstate_threads,omitempty"`
 }
 
 func aTob[a, b any](aa []a, conv func(item a) b) []b {
@@ -915,14 +1050,12 @@ func GetProcInfo(ctx context.Context, addr string) ProcInfo {
 
 	procInfo.IsBackground, err = proc.BackgroundWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[BackgroundWithContext: %q]", err.Error())
 	}
 
 	procInfo.CPUPercent, err = proc.CPUPercentWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[CPUPercentWithContext: %q]", err.Error())
 	}
 
 	procInfo.ChildrenPIDs = []int32{}
@@ -933,145 +1066,134 @@ func GetProcInfo(ctx context.Context, addr string) ProcInfo {
 
 	procInfo.CmdLine, err = proc.CmdlineWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[CmdlineWithContext: %q]", err.Error())
 	}
 
 	connections, err := proc.ConnectionsWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[ConnectionsWithContext: %q]", err.Error())
+	} else {
+		procInfo.NumConnections = len(connections)
 	}
-	procInfo.NumConnections = len(connections)
 
 	procInfo.CreateTime, err = proc.CreateTimeWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[CreateTimeWithContext: %q]", err.Error())
 	}
 
 	procInfo.CWD, err = proc.CwdWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[CwdWithContext: %q]", err.Error())
 	}
 
 	procInfo.ExecPath, err = proc.ExeWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[ExeWithContext: %q]", err.Error())
 	}
 
 	gids, err := proc.GidsWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[GidsWithContext: %q]", err.Error())
+	} else {
+		procInfo.GIDs = aTob[uint32, int32](gids, func(item uint32) int32 {
+			return int32(item)
+		})
 	}
-	procInfo.GIDs = aTob[uint32, int32](gids, func(item uint32) int32 {
-		return int32(item)
-	})
 
 	ioCounters, err := proc.IOCountersWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[IOCountersWithContext: %q]", err.Error())
+	} else {
+		procInfo.IOCounters = *ioCounters
 	}
-	procInfo.IOCounters = *ioCounters
 
 	procInfo.IsRunning, err = proc.IsRunningWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[IsRunningWithContext: %q]", err.Error())
 	}
 
 	memInfo, err := proc.MemoryInfoWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[MemoryInfoWithContext: %q]", err.Error())
+	} else {
+		procInfo.MemInfo = *memInfo
 	}
-	procInfo.MemInfo = *memInfo
 
 	memMaps, err := proc.MemoryMapsWithContext(ctx, true)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[MemoryMapsWithContext: %q]", err.Error())
+	} else {
+		procInfo.MemMaps = *memMaps
 	}
-	procInfo.MemMaps = *memMaps
 
 	procInfo.MemPercent, err = proc.MemoryPercentWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[MemoryPercentWithContext: %q]", err.Error())
 	}
 
 	procInfo.Name, err = proc.NameWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[NameWithContext: %q]", err.Error())
 	}
 
 	procInfo.Nice, err = proc.NiceWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[NiceWithContext: %q]", err.Error())
 	}
 
 	numCtxSwitches, err := proc.NumCtxSwitchesWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[NumCtxSwitchesWithContext: %q]", err.Error())
+	} else {
+		procInfo.NumCtxSwitches = *numCtxSwitches
 	}
-	procInfo.NumCtxSwitches = *numCtxSwitches
 
 	procInfo.NumFDs, err = proc.NumFDsWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[NumFDsWithContext: %q]", err.Error())
 	}
 
 	procInfo.NumThreads, err = proc.NumThreadsWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[NumThreadsWithContext: %q]", err.Error())
 	}
 
 	pageFaults, err := proc.PageFaultsWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[PageFaultsWithContext: %q]", err.Error())
+	} else {
+		procInfo.PageFaults = *pageFaults
 	}
-	procInfo.PageFaults = *pageFaults
 
 	procInfo.PPID, _ = proc.PpidWithContext(ctx)
 
 	status, err := proc.StatusWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[StatusWithContext: %q]", err.Error())
+	} else {
+		procInfo.Status = status[0]
 	}
-	procInfo.Status = status[0]
 
 	procInfo.TGID, err = proc.Tgid()
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[Tgid: %q]", err.Error())
 	}
 
 	times, err := proc.TimesWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[TimesWithContext: %q]", err.Error())
+	} else {
+		procInfo.Times = *times
 	}
-	procInfo.Times = *times
 
 	uids, err := proc.UidsWithContext(ctx)
 	if err != nil {
-		procInfo.Error = err.Error()
-		return procInfo
+		procInfo.Error += fmt.Sprintf("[UidsWithContext: %q]", err.Error())
+	} else {
+		procInfo.UIDs = aTob[uint32, int32](uids, func(item uint32) int32 {
+			return int32(item)
+		})
 	}
-	procInfo.UIDs = aTob[uint32, int32](uids, func(item uint32) int32 {
-		return int32(item)
-	})
 
 	// In certain environments, it is not possible to get username e.g. minio-operator
 	// Plus it's not a serious error. So ignore error if any.
@@ -1081,6 +1203,84 @@ func GetProcInfo(ctx context.Context, addr string) ProcInfo {
 	}
 
 	return procInfo
+}
+
+// AddProcInfo aggregates process information into ProcessMetrics
+func (p *ProcInfo) AddProcInfo(metrics *ProcessMetrics) {
+	if p == nil || metrics == nil {
+		return
+	}
+
+	// Set collection time
+	metrics.CollectedAt = time.Now()
+	metrics.Nodes = 1
+	metrics.Count++
+
+	// Aggregate numeric values
+	metrics.TotalCPUPercent += p.CPUPercent
+	metrics.TotalNumConnections += p.NumConnections
+
+	// Convert CreateTime (timestamp in milliseconds since epoch) to running seconds
+	if p.CreateTime > 0 {
+		createTimeSeconds := float64(p.CreateTime) / 1000.0
+		nowSeconds := float64(time.Now().Unix())
+		runningSecs := nowSeconds - createTimeSeconds
+		metrics.TotalRunningSecs += runningSecs
+	}
+
+	metrics.TotalNumFDs += int64(p.NumFDs)
+	metrics.TotalNumThreads += int64(p.NumThreads)
+	metrics.TotalNice += int64(p.Nice)
+
+	// Count boolean fields
+	if p.IsBackground {
+		metrics.BackgroundProcesses++
+	}
+	if p.IsRunning {
+		metrics.RunningProcesses++
+	}
+
+	// Aggregate memory info
+	metrics.MemInfo.RSS += p.MemInfo.RSS
+	metrics.MemInfo.VMS += p.MemInfo.VMS
+	// Note: Some fields like HWM, Data, Stack, Locked, Swap, Shared may not be available on all platforms
+	// For basic compatibility, only use RSS and VMS which are most commonly available
+	metrics.MemInfo.Count++
+
+	// Aggregate IO counters
+	metrics.IOCounters.ReadCount += p.IOCounters.ReadCount
+	metrics.IOCounters.WriteCount += p.IOCounters.WriteCount
+	metrics.IOCounters.ReadBytes += p.IOCounters.ReadBytes
+	metrics.IOCounters.WriteBytes += p.IOCounters.WriteBytes
+	metrics.IOCounters.Count++
+
+	// Aggregate context switches
+	metrics.NumCtxSwitches.Voluntary += p.NumCtxSwitches.Voluntary
+	metrics.NumCtxSwitches.Involuntary += p.NumCtxSwitches.Involuntary
+	metrics.NumCtxSwitches.Count++
+
+	// Aggregate page faults
+	metrics.PageFaults.MinorFaults += p.PageFaults.MinorFaults
+	metrics.PageFaults.MajorFaults += p.PageFaults.MajorFaults
+	metrics.PageFaults.ChildMinorFaults += p.PageFaults.ChildMinorFaults
+	metrics.PageFaults.ChildMajorFaults += p.PageFaults.ChildMajorFaults
+	metrics.PageFaults.Count++
+
+	// Aggregate CPU times
+	metrics.CPUTimes.User += p.Times.User
+	metrics.CPUTimes.System += p.Times.System
+	metrics.CPUTimes.Idle += p.Times.Idle
+	metrics.CPUTimes.Nice += p.Times.Nice
+	metrics.CPUTimes.Iowait += p.Times.Iowait
+	metrics.CPUTimes.Irq += p.Times.Irq
+	metrics.CPUTimes.Softirq += p.Times.Softirq
+	metrics.CPUTimes.Steal += p.Times.Steal
+	metrics.CPUTimes.Guest += p.Times.Guest
+	metrics.CPUTimes.GuestNice += p.Times.GuestNice
+	metrics.CPUTimes.Count++
+
+	// Aggregate memory maps (platform-specific)
+	addMemoryMaps(p.MemMaps, &metrics.MemMaps)
 }
 
 // SysInfo - Includes hardware and system information of the MinIO cluster
@@ -1098,15 +1298,44 @@ type SysInfo struct {
 	KubernetesInfo KubernetesInfo `json:"kubernetes"`
 }
 
+// DeploymentInfo contains diagnostic information about the AIStor deployment
+// managed by the operator.
+type DeploymentInfo struct {
+	Operator    OperatorInfo    `json:"operator"`
+	ObjectStore ObjectStoreInfo `json:"objectStore"`
+	KES         *KESInfo        `json:"kes,omitempty"`
+}
+
+// OperatorInfo contains information about the AIStor operator.
+type OperatorInfo struct {
+	Version   string `json:"version"`
+	Image     string `json:"image,omitempty"`
+	HelmChart string `json:"helmChart,omitempty"`
+}
+
+// ObjectStoreInfo contains information about the ObjectStore deployment.
+type ObjectStoreInfo struct {
+	Image        string `json:"image"`
+	SidecarImage string `json:"sidecarImage"`
+	HelmChart    string `json:"helmChart,omitempty"`
+}
+
+// KESInfo contains information about the KES deployment.
+type KESInfo struct {
+	Image        string `json:"image,omitempty"`
+	SidecarImage string `json:"sidecarImage,omitempty"`
+}
+
 // KubernetesInfo - Information about the kubernetes platform
 type KubernetesInfo struct {
-	Major      string    `json:"major,omitempty"`
-	Minor      string    `json:"minor,omitempty"`
-	GitVersion string    `json:"gitVersion,omitempty"`
-	GitCommit  string    `json:"gitCommit,omitempty"`
-	BuildDate  time.Time `json:"buildDate,omitempty"`
-	Platform   string    `json:"platform,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Major      string          `json:"major,omitempty"`
+	Minor      string          `json:"minor,omitempty"`
+	GitVersion string          `json:"gitVersion,omitempty"`
+	GitCommit  string          `json:"gitCommit,omitempty"`
+	BuildDate  time.Time       `json:"buildDate,omitempty"`
+	Platform   string          `json:"platform,omitempty"`
+	Deployment *DeploymentInfo `json:"deployment,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 // SpeedTestResults - Includes perf test results of the MinIO cluster
@@ -1139,31 +1368,32 @@ type ServerInfo struct {
 	GoMaxProcs     int               `json:"go_max_procs"`
 	NumCPU         int               `json:"num_cpu"`
 	RuntimeVersion string            `json:"runtime_version"`
-	GCStats        *GCStats          `json:"gc_stats,omitempty"`
 	MinioEnvVars   map[string]string `json:"minio_env_vars,omitempty"`
 	Edition        string            `json:"edition"`
 	License        *LicenseInfo      `json:"license,omitempty"`
+	APIVersion     *APIVersion       `json:"api_version,omitempty"`
 }
 
 // MinioInfo contains MinIO server and object storage information.
 type MinioInfo struct {
-	Mode         string           `json:"mode,omitempty"`
-	Domain       []string         `json:"domain,omitempty"`
-	Region       string           `json:"region,omitempty"`
-	SQSARN       []string         `json:"sqsARN,omitempty"`
-	DeploymentID string           `json:"deploymentID,omitempty"`
-	Buckets      Buckets          `json:"buckets,omitempty"`
-	BucketQuota  *BucketQuotaDiag `json:"bucket_quota,omitempty"`
-	Objects      Objects          `json:"objects,omitempty"`
-	Usage        Usage            `json:"usage,omitempty"`
-	Services     Services         `json:"services,omitempty"`
-	Backend      interface{}      `json:"backend,omitempty"`
-	Servers      []ServerInfo     `json:"servers,omitempty"`
-	TLS          *TLSInfo         `json:"tls"`
-	IsKubernetes *bool            `json:"is_kubernetes"`
-	IsDocker     *bool            `json:"is_docker"`
-	Metrics      *RealtimeMetrics `json:"metrics,omitempty"`
-	TierConfigs  []TierConfig     `json:"tier_configs,omitempty"`
+	Mode         string                         `json:"mode,omitempty"`
+	Domain       []string                       `json:"domain,omitempty"`
+	Region       string                         `json:"region,omitempty"`
+	SQSARN       []string                       `json:"sqsARN,omitempty"`
+	DeploymentID string                         `json:"deploymentID,omitempty"`
+	Buckets      Buckets                        `json:"buckets,omitempty"`
+	BucketQuota  *BucketQuotaDiag               `json:"bucket_quota,omitempty"`
+	Objects      Objects                        `json:"objects,omitempty"`
+	Usage        Usage                          `json:"usage,omitempty"`
+	Services     Services                       `json:"services,omitempty"`
+	Backend      interface{}                    `json:"backend,omitempty"`
+	Servers      []ServerInfo                   `json:"servers,omitempty"`
+	TLS          *TLSInfo                       `json:"tls"`
+	IsKubernetes *bool                          `json:"is_kubernetes"`
+	IsDocker     *bool                          `json:"is_docker"`
+	Metrics      *RealtimeMetrics               `json:"metrics,omitempty"`
+	TierConfigs  []TierConfig                   `json:"tier_configs,omitempty"`
+	Pools        map[int]map[int]ErasureSetInfo `json:"pools,omitempty"`
 }
 
 type TLSInfo struct {
@@ -1199,6 +1429,19 @@ type ShardsHealthInfo struct {
 	FailedWrites map[string]map[string][]uint64 `json:"failed_writes,omitempty"`
 }
 
+// IAMPolicyDiag holds per-policy diagnostic findings.
+type IAMPolicyDiag struct {
+	UnsafeConditionKeys []string `json:"unsafe_condition_keys,omitempty"`
+}
+
+// IAMInfo carries IAM diagnostics. TotalPolicies is the count of policies
+// inspected; FlaggedPolicies lists only those with at least one finding.
+type IAMInfo struct {
+	Error           string                   `json:"error,omitempty"`
+	TotalPolicies   int                      `json:"total_policies,omitempty"`
+	FlaggedPolicies map[string]IAMPolicyDiag `json:"flagged_policies,omitempty"`
+}
+
 // MinioHealthInfo - Includes MinIO confifuration information
 type MinioHealthInfo struct {
 	Error string `json:"error,omitempty"`
@@ -1208,6 +1451,7 @@ type MinioHealthInfo struct {
 	Replication     *ReplDiagInfo     `json:"replication,omitempty"` // Deprecated May 2025
 	ReplicationInfo *ReplDiagInfoV2   `json:"replication_info,omitempty"`
 	ShardsHealth    *ShardsHealthInfo `json:"shards_health,omitempty"`
+	IAMInfo         *IAMInfo          `json:"iam_info,omitempty"`
 }
 
 // HealthInfo - MinIO cluster's health Info
@@ -1260,36 +1504,40 @@ type HealthDataType string
 
 // HealthDataTypes
 const (
-	HealthDataTypeMinioInfo    HealthDataType = "minioinfo"
-	HealthDataTypeMinioConfig  HealthDataType = "minioconfig"
-	HealthDataTypeSysCPU       HealthDataType = "syscpu"
-	HealthDataTypeSysDriveHw   HealthDataType = "sysdrivehw"
-	HealthDataTypeSysOsInfo    HealthDataType = "sysosinfo"
-	HealthDataTypeSysMem       HealthDataType = "sysmem"
-	HealthDataTypeSysNet       HealthDataType = "sysnet"
-	HealthDataTypeSysProcess   HealthDataType = "sysprocess"
-	HealthDataTypeSysErrors    HealthDataType = "syserrors"
-	HealthDataTypeSysServices  HealthDataType = "sysservices"
-	HealthDataTypeSysConfig    HealthDataType = "sysconfig"
-	HealthDataTypeReplication  HealthDataType = "replication"
-	HealthDataTypeShardsHealth HealthDataType = "shardshealth"
+	HealthDataTypeMinioInfo      HealthDataType = "minioinfo"
+	HealthDataTypeMinioConfig    HealthDataType = "minioconfig"
+	HealthDataTypeSysCPU         HealthDataType = "syscpu"
+	HealthDataTypeSysDriveHw     HealthDataType = "sysdrivehw"
+	HealthDataTypeSysOsInfo      HealthDataType = "sysosinfo"
+	HealthDataTypeSysMem         HealthDataType = "sysmem"
+	HealthDataTypeSysNet         HealthDataType = "sysnet"
+	HealthDataTypeSysProcess     HealthDataType = "sysprocess"
+	HealthDataTypeSysErrors      HealthDataType = "syserrors"
+	HealthDataTypeSysServices    HealthDataType = "sysservices"
+	HealthDataTypeSysConfig      HealthDataType = "sysconfig"
+	HealthDataTypeSysProductInfo HealthDataType = "sysproductinfo"
+	HealthDataTypeReplication    HealthDataType = "replication"
+	HealthDataTypeShardsHealth   HealthDataType = "shardshealth"
+	HealthDataTypeIAMInfo        HealthDataType = "iaminfo"
 )
 
 // HealthDataTypesMap - Map of Health datatypes
 var HealthDataTypesMap = map[string]HealthDataType{
-	"minioinfo":    HealthDataTypeMinioInfo,
-	"minioconfig":  HealthDataTypeMinioConfig,
-	"syscpu":       HealthDataTypeSysCPU,
-	"sysdrivehw":   HealthDataTypeSysDriveHw,
-	"sysosinfo":    HealthDataTypeSysOsInfo,
-	"sysmem":       HealthDataTypeSysMem,
-	"sysnet":       HealthDataTypeSysNet,
-	"sysprocess":   HealthDataTypeSysProcess,
-	"syserrors":    HealthDataTypeSysErrors,
-	"sysservices":  HealthDataTypeSysServices,
-	"sysconfig":    HealthDataTypeSysConfig,
-	"replication":  HealthDataTypeReplication,
-	"shardshealth": HealthDataTypeShardsHealth,
+	"minioinfo":      HealthDataTypeMinioInfo,
+	"minioconfig":    HealthDataTypeMinioConfig,
+	"syscpu":         HealthDataTypeSysCPU,
+	"sysdrivehw":     HealthDataTypeSysDriveHw,
+	"sysosinfo":      HealthDataTypeSysOsInfo,
+	"sysmem":         HealthDataTypeSysMem,
+	"sysnet":         HealthDataTypeSysNet,
+	"sysprocess":     HealthDataTypeSysProcess,
+	"syserrors":      HealthDataTypeSysErrors,
+	"sysservices":    HealthDataTypeSysServices,
+	"sysconfig":      HealthDataTypeSysConfig,
+	"sysproductinfo": HealthDataTypeSysProductInfo,
+	"replication":    HealthDataTypeReplication,
+	"shardshealth":   HealthDataTypeShardsHealth,
+	"iaminfo":        HealthDataTypeIAMInfo,
 }
 
 // HealthDataTypesList - List of health datatypes
@@ -1305,8 +1553,10 @@ var HealthDataTypesList = []HealthDataType{
 	HealthDataTypeSysErrors,
 	HealthDataTypeSysServices,
 	HealthDataTypeSysConfig,
+	HealthDataTypeSysProductInfo,
 	HealthDataTypeReplication,
 	HealthDataTypeShardsHealth,
+	HealthDataTypeIAMInfo,
 }
 
 // HealthInfoVersionStruct - struct for health info version
@@ -1340,7 +1590,6 @@ func (adm *AdminClient) ServerHealthInfo(ctx context.Context, types []HealthData
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		closeResponse(resp)
 		return nil, "", httpRespToErrorResponse(resp)
 	}
 
@@ -1361,6 +1610,16 @@ func (adm *AdminClient) ServerHealthInfo(ctx context.Context, types []HealthData
 	default:
 		closeResponse(resp)
 		return nil, "", errors.New("Upgrade Minio Client to support health info version " + version.Version)
+	}
+
+	// decoder reads ahead, so it can hold bytes belonging to the frames after
+	// the version one. Callers decode those from resp.Body with a decoder of
+	// their own, so the buffered remainder has to go back in front of the
+	// stream; otherwise the next frame silently loses its prefix.
+	body := resp.Body
+	resp.Body = &closeWrapper{
+		Reader: io.MultiReader(decoder.Buffered(), body),
+		Closer: body,
 	}
 
 	return resp, version.Version, nil

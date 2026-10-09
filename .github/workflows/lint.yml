@@ -1,7 +1,7 @@
-name: Golangci-lint
+name: Sovereign Golangci-lint
 
 on:
-  workflow_dispatch:   # ability to manually run from the github actions UI
+  workflow_dispatch: # ability to manually run from the github actions UI
   pull_request:
     branches:
       - main
@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        go-version: [1.24.x]
+        go-version: [1.25.x]
     steps:
       - name: Set up Go ${{ matrix.go-version }}
         uses: actions/setup-go@v5
@@ -35,7 +35,7 @@ jobs:
         with:
           args: --timeout 5m --config ./.golangci.yml
 
-      - name:  Staticcheck run with go vet
+      - name: Staticcheck run with go vet
         run: |
           echo "Running go vet..."
           go vet -vettool=$(which staticcheck) ./...
@@ -43,8 +43,6 @@ jobs:
       - name: Regenerate, vet and test for generated files
         run: |
           go vet ./...
-          go install -v tool
-          export PATH=${PATH}:$(go env GOPATH)/bin
           go generate ./... >/dev/null
           (! git diff --name-only | grep '_gen.go$') || \
             (echo "Non-committed changes in auto-generated code is detected, please commit them to proceed." && false)

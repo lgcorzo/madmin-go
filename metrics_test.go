@@ -1,0 +1,4614 @@
+//
+// Copyright (c) 2015-2025 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+//
+
+package madmin
+
+import (
+	"fmt"
+	"math"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/prometheus/procfs"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/load"
+)
+
+// TestScannerMetricsMerge tests ScannerMetrics.Merge functionality
+func TestScannerMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+	yesterday := now.AddDate(0, 0, -1)
+	lastMonth := now.AddDate(0, -1, 0)
+	lastYear := now.AddDate(-1, 0, 0)
+
+	tests := []struct {
+		name   string
+		base   *ScannerMetrics
+		other  *ScannerMetrics
+		verify func(t *testing.T, result *ScannerMetrics)
+	}{
+		{
+			name: "merge nil other",
+			base: &ScannerMetrics{
+				CollectedAt:    now,
+				OngoingBuckets: 5,
+			},
+			other: nil,
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if result.OngoingBuckets != 5 {
+					t.Errorf("OngoingBuckets = %d, want 5", result.OngoingBuckets)
+				}
+			},
+		},
+		{
+			name: "merge with later timestamp",
+			base: &ScannerMetrics{
+				CollectedAt:    now,
+				OngoingBuckets: 5,
+			},
+			other: &ScannerMetrics{
+				CollectedAt:    later,
+				OngoingBuckets: 10,
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				if result.OngoingBuckets != 10 {
+					t.Errorf("OngoingBuckets = %d, want 10", result.OngoingBuckets)
+				}
+			},
+		},
+		{
+			name: "merge lifetime ops",
+			base: &ScannerMetrics{
+				LifeTimeOps: map[string]uint64{"op1": 100, "op2": 200},
+			},
+			other: &ScannerMetrics{
+				LifeTimeOps: map[string]uint64{"op1": 50, "op3": 300},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				expected := map[string]uint64{"op1": 150, "op2": 200, "op3": 300}
+				if !reflect.DeepEqual(result.LifeTimeOps, expected) {
+					t.Errorf("LifeTimeOps = %v, want %v", result.LifeTimeOps, expected)
+				}
+			},
+		},
+		{
+			name: "merge excessive prefixes",
+			base: &ScannerMetrics{
+				ExcessivePrefixes: []string{"prefix1", "prefix2"},
+			},
+			other: &ScannerMetrics{
+				ExcessivePrefixes: []string{"prefix2", "prefix3"},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				expected := []string{"prefix1", "prefix2", "prefix3"}
+				if !reflect.DeepEqual(result.ExcessivePrefixes, expected) {
+					t.Errorf("ExcessivePrefixes = %v, want %v", result.ExcessivePrefixes, expected)
+				}
+			},
+		},
+		{
+			name: "merge excessive version objects",
+			base: &ScannerMetrics{
+				ExcessiveVersionObjects: []string{"bucket1/obj1", "bucket1/obj2"},
+			},
+			other: &ScannerMetrics{
+				ExcessiveVersionObjects: []string{"bucket1/obj2", "bucket2/obj1"},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				expected := []string{"bucket1/obj1", "bucket1/obj2", "bucket2/obj1"}
+				if !reflect.DeepEqual(result.ExcessiveVersionObjects, expected) {
+					t.Errorf("ExcessiveVersionObjects = %v, want %v", result.ExcessiveVersionObjects, expected)
+				}
+				if result.DiscardedExcessEntries != 0 {
+					t.Errorf("DiscardedExcessEntries = %d, want 0", result.DiscardedExcessEntries)
+				}
+			},
+		},
+		{
+			name: "merge excess version objects cap at 100 entries",
+			base: func() *ScannerMetrics {
+				paths := make([]string, 80)
+				for i := range 80 {
+					paths[i] = fmt.Sprintf("prefix%03d", i)
+				}
+				return &ScannerMetrics{ExcessiveVersionObjects: paths}
+			}(),
+			other: func() *ScannerMetrics {
+				paths := make([]string, 60)
+				for i := range 60 {
+					paths[i] = fmt.Sprintf("prefix%03d", i+50) // 50–109, overlap at 50–79
+				}
+				return &ScannerMetrics{ExcessiveVersionObjects: paths}
+			}(),
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				// 0–109 unique = 110 total; cap is 100, so 10 discarded
+				if len(result.ExcessiveVersionObjects) != 100 {
+					t.Errorf("ExcessiveVersionObjects length = %d, want 100", len(result.ExcessiveVersionObjects))
+				}
+				if result.DiscardedExcessEntries != 10 {
+					t.Errorf("DiscardedExcessEntries = %d, want 10", result.DiscardedExcessEntries)
+				}
+			},
+		},
+		{
+			name: "discarded excess entries accumulate across merges",
+			base: &ScannerMetrics{
+				DiscardedExcessEntries: 5,
+			},
+			other: &ScannerMetrics{
+				DiscardedExcessEntries: 3,
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if result.DiscardedExcessEntries != 8 {
+					t.Errorf("DiscardedExcessEntries = %d, want 8", result.DiscardedExcessEntries)
+				}
+			},
+		},
+		{
+			name: "merge queued for expiry",
+			base: &ScannerMetrics{
+				QueuedForExpiry: append([]ExpiryObject{{QueuedAt: now}, {QueuedAt: yesterday}}, make([]ExpiryObject, 25)...),
+			},
+			other: &ScannerMetrics{
+				QueuedForExpiry: []ExpiryObject{{QueuedAt: lastMonth}, {QueuedAt: lastYear}},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if len(result.QueuedForExpiry) != 25 {
+					t.Errorf("QueuedForExpiry length = %d, want 25", len(result.QueuedForExpiry))
+				}
+				// Check sorted order of first 5
+				expectedFirstFive := []ExpiryObject{
+					{QueuedAt: now},
+					{QueuedAt: yesterday},
+					{QueuedAt: lastMonth},
+					{QueuedAt: lastYear},
+					{QueuedAt: time.Time{}},
+				}
+				if !reflect.DeepEqual(result.QueuedForExpiry[:5], expectedFirstFive) {
+					t.Errorf("QueuedForExpiry[:5] = %v, want %v", result.QueuedForExpiry[:5], expectedFirstFive)
+				}
+			},
+		},
+		{
+			name: "merge bucket lifetime ILM same bucket same action summed",
+			base: &ScannerMetrics{
+				BucketLifeTimeILM: map[string]*BucketILMStats{
+					"bucket-a": {Bucket: "bucket-a", ActionCounters: map[string]uint64{"DeleteAction": 100, "TransitionAction": 50}},
+				},
+			},
+			other: &ScannerMetrics{
+				BucketLifeTimeILM: map[string]*BucketILMStats{
+					"bucket-a": {Bucket: "bucket-a", ActionCounters: map[string]uint64{"DeleteAction": 200, "TransitionAction": 25}},
+				},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				expected := map[string]*BucketILMStats{
+					"bucket-a": {Bucket: "bucket-a", ActionCounters: map[string]uint64{"DeleteAction": 300, "TransitionAction": 75}},
+				}
+				if !reflect.DeepEqual(result.BucketLifeTimeILM, expected) {
+					t.Errorf("BucketLifeTimeILM = %v, want %v", result.BucketLifeTimeILM, expected)
+				}
+			},
+		},
+		{
+			name: "merge bucket lifetime ILM different buckets both appear",
+			base: &ScannerMetrics{
+				BucketLifeTimeILM: map[string]*BucketILMStats{
+					"bucket-a": {Bucket: "bucket-a", ActionCounters: map[string]uint64{"DeleteAction": 10}},
+				},
+			},
+			other: &ScannerMetrics{
+				BucketLifeTimeILM: map[string]*BucketILMStats{
+					"bucket-b": {Bucket: "bucket-b", ActionCounters: map[string]uint64{"TransitionAction": 20}},
+				},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if len(result.BucketLifeTimeILM) != 2 {
+					t.Fatalf("BucketLifeTimeILM len = %d, want 2", len(result.BucketLifeTimeILM))
+				}
+				if got := result.BucketLifeTimeILM["bucket-a"].ActionCounters["DeleteAction"]; got != 10 {
+					t.Errorf("bucket-a DeleteAction = %d, want 10", got)
+				}
+				if got := result.BucketLifeTimeILM["bucket-b"].ActionCounters["TransitionAction"]; got != 20 {
+					t.Errorf("bucket-b TransitionAction = %d, want 20", got)
+				}
+			},
+		},
+		{
+			name: "merge bucket lifetime ILM nil on one side does not panic",
+			base: &ScannerMetrics{
+				BucketLifeTimeILM: map[string]*BucketILMStats{
+					"bucket-a": {Bucket: "bucket-a", ActionCounters: map[string]uint64{"DeleteAction": 5}},
+				},
+			},
+			other: &ScannerMetrics{
+				BucketLifeTimeILM: nil,
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if got := result.BucketLifeTimeILM["bucket-a"].ActionCounters["DeleteAction"]; got != 5 {
+					t.Errorf("bucket-a DeleteAction = %d, want 5", got)
+				}
+			},
+		},
+		{
+			name: "merge bucket lifetime ILM nil base populated by other",
+			base: &ScannerMetrics{
+				BucketLifeTimeILM: nil,
+			},
+			other: &ScannerMetrics{
+				BucketLifeTimeILM: map[string]*BucketILMStats{
+					"bucket-c": {Bucket: "bucket-c", ActionCounters: map[string]uint64{"DeleteVersionAction": 7}},
+				},
+			},
+			verify: func(t *testing.T, result *ScannerMetrics) {
+				if got := result.BucketLifeTimeILM["bucket-c"].ActionCounters["DeleteVersionAction"]; got != 7 {
+					t.Errorf("bucket-c DeleteVersionAction = %d, want 7", got)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+func TestSegmentedAddCopySlice(t *testing.T) {
+	now := time.Now()
+
+	original := &SegmentedReplicationStats{
+		Interval:  60,
+		FirstTime: now,
+		Segments: []ReplicationStats{
+			{Nodes: 1, Events: 100, Bytes: 1000},
+			{Nodes: 1, Events: 200, Bytes: 2000},
+		},
+	}
+
+	empty := &SegmentedReplicationStats{}
+
+	empty.Add(original)
+
+	if len(empty.Segments) != 2 {
+		t.Fatalf("empty.Segments length = %d, want 2", len(empty.Segments))
+	}
+	if empty.Segments[0].Events != 100 {
+		t.Errorf("empty.Segments[0].Events = %d, want 100", empty.Segments[0].Events)
+	}
+	if empty.Segments[1].Events != 200 {
+		t.Errorf("empty.Segments[1].Events = %d, want 200", empty.Segments[1].Events)
+	}
+
+	empty.Segments[0].Events = 999
+	empty.Segments[1].Events = 888
+
+	if original.Segments[0].Events != 100 {
+		t.Errorf("original.Segments[0].Events = %d, want 100 (should not be modified)", original.Segments[0].Events)
+	}
+	if original.Segments[1].Events != 200 {
+		t.Errorf("original.Segments[1].Events = %d, want 200 (should not be modified)", original.Segments[1].Events)
+	}
+
+	if empty.Segments[0].Events != 999 {
+		t.Errorf("empty.Segments[0].Events = %d, want 999", empty.Segments[0].Events)
+	}
+	if empty.Segments[1].Events != 888 {
+		t.Errorf("empty.Segments[1].Events = %d, want 888", empty.Segments[1].Events)
+	}
+}
+
+func TestDiskMetricMergeDiscardsOverflowSegments(t *testing.T) {
+	ft := time.Unix(1700000000, 0).UTC()
+	dayWith := func(readIOs uint64) SegmentedDiskIO {
+		return SegmentedDiskIO{Interval: 900, FirstTime: ft, Segments: []DiskIOStats{{N: 1, ReadIOs: readIOs}}}
+	}
+	const overflow = uint64(math.MaxUint64) - 100 // uint64 underflow artifact (bit 63 set)
+
+	// Overflowed segment in an accumulated set is discarded; the good base stays.
+	merged := DiskMetric{}
+	merged.Merge(&DiskMetric{NDisks: 1, IOStatsDay: dayWith(1000)}) // clone path
+	merged.Merge(&DiskMetric{NDisks: 1, IOStatsDay: dayWith(overflow)})
+	if got := merged.IOStatsDay.Segments[0].ReadIOs; got != 1000 {
+		t.Errorf("accumulate: ReadIOs = %d, want 1000 (overflow discarded)", got)
+	}
+
+	// Overflowed segment in the first (cloned) set is discarded and not aliased.
+	merged2 := DiskMetric{}
+	badFirst := &DiskMetric{NDisks: 1, IOStatsDay: dayWith(overflow)}
+	merged2.Merge(badFirst) // clone path -> overflow zeroed
+	merged2.Merge(&DiskMetric{NDisks: 1, IOStatsDay: dayWith(2000)})
+	if got := merged2.IOStatsDay.Segments[0].ReadIOs; got != 2000 {
+		t.Errorf("clone: ReadIOs = %d, want 2000 (first-set overflow discarded)", got)
+	}
+	if got := badFirst.IOStatsDay.Segments[0].ReadIOs; got != overflow {
+		t.Errorf("clone: source mutated, ReadIOs = %d, want %d", got, overflow)
+	}
+}
+
+func TestDiskMetricMergeCacheNoDouble(t *testing.T) {
+	// Accumulate path (base already has drives) where the base has no cache but
+	// a later metric does: the cache must be copied, not aliased-and-self-merged
+	// (which doubled the values and corrupted the source metric).
+	base := &DiskMetric{NDisks: 1}
+	other := &DiskMetric{
+		NDisks: 1,
+		Cache:  &CacheStats{N: 1, Capacity: 1000, Used: 400, Hits: 80, Misses: 20},
+	}
+
+	base.Merge(other)
+
+	if base.Cache == nil {
+		t.Fatal("merged Cache = nil, want copied cache")
+	}
+	if base.Cache.Capacity != 1000 || base.Cache.Hits != 80 {
+		t.Errorf("merged Cache = %+v, want Capacity 1000 / Hits 80 (not doubled)", *base.Cache)
+	}
+	if other.Cache.Capacity != 1000 || other.Cache.Hits != 80 {
+		t.Errorf("source Cache mutated = %+v, want unchanged Capacity 1000 / Hits 80", *other.Cache)
+	}
+	if base.Cache == other.Cache {
+		t.Error("merged Cache aliases source Cache; want an independent copy")
+	}
+}
+
+// TestDiskMetricMerge tests DiskMetric.Merge functionality
+func TestDiskMetricMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *DiskMetric
+		other  *DiskMetric
+		verify func(t *testing.T, result *DiskMetric)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &DiskMetric{NDisks: 5},
+			other: nil,
+			verify: func(t *testing.T, result *DiskMetric) {
+				if result.NDisks != 5 {
+					t.Errorf("NDisks = %d, want 5", result.NDisks)
+				}
+			},
+		},
+		{
+			name:  "merge empty base",
+			base:  &DiskMetric{},
+			other: &DiskMetric{NDisks: 10, Offline: 2},
+			verify: func(t *testing.T, result *DiskMetric) {
+				if result.NDisks != 10 {
+					t.Errorf("NDisks = %d, want 10", result.NDisks)
+				}
+				if result.Offline != 2 {
+					t.Errorf("Offline = %d, want 2", result.Offline)
+				}
+			},
+		},
+		{
+			name: "merge disk counts",
+			base: &DiskMetric{
+				CollectedAt: now,
+				NDisks:      5,
+				Offline:     1,
+				Healing:     2,
+				Hanging:     1,
+			},
+			other: &DiskMetric{
+				CollectedAt: later,
+				NDisks:      3,
+				Offline:     2,
+				Healing:     1,
+				Hanging:     2,
+			},
+			verify: func(t *testing.T, result *DiskMetric) {
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				if result.NDisks != 8 {
+					t.Errorf("NDisks = %d, want 8", result.NDisks)
+				}
+				if result.Offline != 3 {
+					t.Errorf("Offline = %d, want 3", result.Offline)
+				}
+				if result.Healing != 3 {
+					t.Errorf("Healing = %d, want 3", result.Healing)
+				}
+				if result.Hanging != 3 {
+					t.Errorf("Hanging = %d, want 3", result.Hanging)
+				}
+			},
+		},
+		{
+			name: "merge io stats",
+			base: &DiskMetric{
+				NDisks:        1, // Need non-zero NDisks to actually merge
+				IOStatsMinute: DiskIOStats{N: 1, ReadIOs: 100, WriteIOs: 200},
+			},
+			other: &DiskMetric{
+				NDisks:        1,
+				IOStatsMinute: DiskIOStats{N: 1, ReadIOs: 50, WriteIOs: 100},
+			},
+			verify: func(t *testing.T, result *DiskMetric) {
+				if result.NDisks != 2 {
+					t.Errorf("NDisks = %d, want 2", result.NDisks)
+				}
+				if result.IOStatsMinute.N != 2 {
+					t.Errorf("IOStatsMinute.N = %d, want 2", result.IOStatsMinute.N)
+				}
+				if result.IOStatsMinute.ReadIOs != 150 {
+					t.Errorf("IOStatsMinute.ReadIOs = %d, want 150", result.IOStatsMinute.ReadIOs)
+				}
+				if result.IOStatsMinute.WriteIOs != 300 {
+					t.Errorf("IOStatsMinute.WriteIOs = %d, want 300", result.IOStatsMinute.WriteIOs)
+				}
+			},
+		},
+		{
+			name: "merge SMART data",
+			base: &DiskMetric{
+				NDisks: 1,
+				SMART: &SMARTInfo{
+					N:            1,
+					Status:       map[string]int{"healthy": 1},
+					StatsN:       1,
+					Temperature:  40.0,
+					PowerOnHours: 1000,
+				},
+			},
+			other: &DiskMetric{
+				NDisks: 1,
+				SMART: &SMARTInfo{
+					N:            1,
+					Status:       map[string]int{"healthy": 1, "warning": 1},
+					StatsN:       1,
+					Temperature:  45.0,
+					PowerOnHours: 2000,
+				},
+			},
+			verify: func(t *testing.T, result *DiskMetric) {
+				if result.SMART == nil {
+					t.Error("SMART should not be nil after merge")
+					return
+				}
+				if result.SMART.N != 2 {
+					t.Errorf("SMART.N = %d, want 2", result.SMART.N)
+				}
+				if result.SMART.Status["healthy"] != 2 {
+					t.Errorf("SMART.Status[healthy] = %d, want 2", result.SMART.Status["healthy"])
+				}
+				if result.SMART.Status["warning"] != 1 {
+					t.Errorf("SMART.Status[warning] = %d, want 1", result.SMART.Status["warning"])
+				}
+				if result.SMART.Temperature != 85.0 {
+					t.Errorf("SMART.Temperature = %f, want 85.0", result.SMART.Temperature)
+				}
+				if result.SMART.PowerOnHours != 3000 {
+					t.Errorf("SMART.PowerOnHours = %f, want 3000", result.SMART.PowerOnHours)
+				}
+			},
+		},
+		{
+			name: "merge SMART data into empty base",
+			base: &DiskMetric{
+				NDisks: 1,
+			},
+			other: &DiskMetric{
+				NDisks: 1,
+				SMART: &SMARTInfo{
+					N:           1,
+					Status:      map[string]int{"healthy": 1},
+					StatsN:      1,
+					Temperature: 40.0,
+				},
+			},
+			verify: func(t *testing.T, result *DiskMetric) {
+				if result.SMART == nil {
+					t.Error("SMART should not be nil after merge")
+					return
+				}
+				if result.SMART.N != 1 {
+					t.Errorf("SMART.N = %d, want 1", result.SMART.N)
+				}
+				if result.SMART.Temperature != 40.0 {
+					t.Errorf("SMART.Temperature = %f, want 40.0", result.SMART.Temperature)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestOSMetricsMerge tests OSMetrics.Merge functionality
+func TestOSMetricsMerge(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   *OSMetrics
+		other  *OSMetrics
+		verify func(t *testing.T, result *OSMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &OSMetrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *OSMetrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge lifetime ops",
+			base: &OSMetrics{
+				LifeTimeOps: map[string]uint64{"read": 1000, "write": 2000},
+			},
+			other: &OSMetrics{
+				LifeTimeOps: map[string]uint64{"read": 500, "delete": 100},
+			},
+			verify: func(t *testing.T, result *OSMetrics) {
+				expected := map[string]uint64{"read": 1500, "write": 2000, "delete": 100}
+				if !reflect.DeepEqual(result.LifeTimeOps, expected) {
+					t.Errorf("LifeTimeOps = %v, want %v", result.LifeTimeOps, expected)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestMemMetricsMerge tests MemMetrics.Merge functionality
+func TestMemMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *MemMetrics
+		other  *MemMetrics
+		verify func(t *testing.T, result *MemMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &MemMetrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *MemMetrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge memory values",
+			base: &MemMetrics{
+				CollectedAt: now,
+				Nodes:       2,
+				Info: MemInfo{
+					Total:          8000,
+					Used:           2000,
+					Free:           6000,
+					Available:      4000,
+					Shared:         100,
+					Cache:          500,
+					Buffers:        300,
+					SwapSpaceTotal: 2000,
+					SwapSpaceFree:  1000,
+					Limit:          8000,
+				},
+			},
+			other: &MemMetrics{
+				CollectedAt: later,
+				Nodes:       3,
+				Info: MemInfo{
+					Total:          8000,
+					Used:           3000,
+					Free:           5000,
+					Available:      3000,
+					Shared:         150,
+					Cache:          400,
+					Buffers:        200,
+					SwapSpaceTotal: 2000,
+					SwapSpaceFree:  500,
+					Limit:          8000,
+				},
+			},
+			verify: func(t *testing.T, result *MemMetrics) {
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				// Verify all MemInfo fields are merged (summed)
+				if result.Info.Total != 16000 {
+					t.Errorf("Info.Total = %d, want 16000", result.Info.Total)
+				}
+				if result.Info.Used != 5000 {
+					t.Errorf("Info.Used = %d, want 5000", result.Info.Used)
+				}
+				if result.Info.Free != 11000 {
+					t.Errorf("Info.Free = %d, want 11000", result.Info.Free)
+				}
+				if result.Info.Available != 7000 {
+					t.Errorf("Info.Available = %d, want 7000", result.Info.Available)
+				}
+				if result.Info.Shared != 250 {
+					t.Errorf("Info.Shared = %d, want 250", result.Info.Shared)
+				}
+				if result.Info.Cache != 900 {
+					t.Errorf("Info.Cache = %d, want 900", result.Info.Cache)
+				}
+				if result.Info.Buffers != 500 {
+					t.Errorf("Info.Buffers = %d, want 500", result.Info.Buffers)
+				}
+				if result.Info.SwapSpaceTotal != 4000 {
+					t.Errorf("Info.SwapSpaceTotal = %d, want 4000", result.Info.SwapSpaceTotal)
+				}
+				if result.Info.SwapSpaceFree != 1500 {
+					t.Errorf("Info.SwapSpaceFree = %d, want 1500", result.Info.SwapSpaceFree)
+				}
+				if result.Info.Limit != 16000 {
+					t.Errorf("Info.Limit = %d, want 16000", result.Info.Limit)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestCPUMetricsMerge tests CPUMetrics.Merge functionality
+func TestCPUMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *CPUMetrics
+		other  *CPUMetrics
+		verify func(t *testing.T, result *CPUMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &CPUMetrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *CPUMetrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge cpu stats",
+			base: &CPUMetrics{
+				CollectedAt: now,
+				Nodes:       2,
+				TimesStat: cpu.TimesStat{
+					User:   100,
+					System: 50,
+					Idle:   1000,
+				},
+				TimesCount: 2,
+				LoadStat: load.AvgStat{
+					Load1:  1.5,
+					Load5:  2.0,
+					Load15: 1.8,
+				},
+				CPUCount: 4,
+			},
+			other: &CPUMetrics{
+				CollectedAt: later,
+				Nodes:       3,
+				TimesStat: cpu.TimesStat{
+					User:   50,
+					System: 25,
+					Idle:   500,
+				},
+				TimesCount: 3,
+				LoadStat: load.AvgStat{
+					Load1:  0.5,
+					Load5:  1.0,
+					Load15: 0.8,
+				},
+				LoadStatCount: 3,
+				CPUCount:      4,
+			},
+			verify: func(t *testing.T, result *CPUMetrics) {
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				if result.TimesStat.User != 150 {
+					t.Errorf("TimesStat.User = %f, want 150", result.TimesStat.User)
+				}
+				if result.TimesStat.System != 75 {
+					t.Errorf("TimesStat.System = %f, want 75", result.TimesStat.System)
+				}
+				if result.TimesStat.Idle != 1500 {
+					t.Errorf("TimesStat.Idle = %f, want 1500", result.TimesStat.Idle)
+				}
+				if result.LoadStat.Load1 != 2.0 {
+					t.Errorf("LoadStat.Load1 = %f, want 2.0", result.LoadStat.Load1)
+				}
+				if result.LoadStat.Load5 != 3.0 {
+					t.Errorf("LoadStat.Load5 = %f, want 3.0", result.LoadStat.Load5)
+				}
+				if result.LoadStat.Load15 != 2.6 {
+					t.Errorf("LoadStat.Load15 = %f, want 2.6", result.LoadStat.Load15)
+				}
+				if result.CPUCount != 8 {
+					t.Errorf("CPUCount = %d, want 8", result.CPUCount)
+				}
+			},
+		},
+		{
+			name: "merge nil TimesStat",
+			base: &CPUMetrics{
+				Nodes:    1,
+				CPUCount: 2,
+			},
+			other: &CPUMetrics{
+				Nodes: 1,
+				TimesStat: cpu.TimesStat{
+					User: 100,
+				},
+				TimesCount: 1,
+				CPUCount:   2,
+			},
+			verify: func(t *testing.T, result *CPUMetrics) {
+				if result.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", result.Nodes)
+				}
+				want := cpu.TimesStat{
+					User: 100,
+				}
+				if result.TimesStat != want {
+					t.Error("TimesStat is nil, should be set")
+				}
+				if result.CPUCount != 4 {
+					t.Errorf("CPUCount = %d, want 4", result.CPUCount)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestAPIMetricsMerge tests APIMetrics.Merge functionality
+func TestAPIMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *APIMetrics
+		other  *APIMetrics
+		verify func(t *testing.T, result *APIMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &APIMetrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *APIMetrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge basic fields",
+			base: &APIMetrics{
+				CollectedAt:    now,
+				Nodes:          2,
+				ActiveRequests: 100,
+				QueuedRequests: 50,
+			},
+			other: &APIMetrics{
+				CollectedAt:    later,
+				Nodes:          3,
+				ActiveRequests: 200,
+				QueuedRequests: 75,
+			},
+			verify: func(t *testing.T, result *APIMetrics) {
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				if result.ActiveRequests != 300 {
+					t.Errorf("ActiveRequests = %d, want 300", result.ActiveRequests)
+				}
+				if result.QueuedRequests != 125 {
+					t.Errorf("QueuedRequests = %d, want 125", result.QueuedRequests)
+				}
+			},
+		},
+		{
+			name: "merge LastMinuteAPI maps",
+			base: &APIMetrics{
+				LastMinuteAPI: map[string]APIStats{
+					"GET": {Requests: 100},
+					"PUT": {Requests: 50},
+				},
+			},
+			other: &APIMetrics{
+				LastMinuteAPI: map[string]APIStats{
+					"GET":    {Requests: 200},
+					"DELETE": {Requests: 25},
+				},
+			},
+			verify: func(t *testing.T, result *APIMetrics) {
+				if result.LastMinuteAPI["GET"].Requests != 300 {
+					t.Errorf("LastMinuteAPI[GET].Requests = %d, want 300", result.LastMinuteAPI["GET"].Requests)
+				}
+				if result.LastMinuteAPI["PUT"].Requests != 50 {
+					t.Errorf("LastMinuteAPI[PUT].Requests = %d, want 50", result.LastMinuteAPI["PUT"].Requests)
+				}
+				if result.LastMinuteAPI["DELETE"].Requests != 25 {
+					t.Errorf("LastMinuteAPI[DELETE].Requests = %d, want 25", result.LastMinuteAPI["DELETE"].Requests)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// Merge sums Nodes, which is only correct along the node axis. SegmentedAPITotal
+// folds along the time axis, where every segment carries the same nodes: a
+// 3-node cluster over 95 quarter-hour segments must still report 3, not 285.
+func TestSegmentedAPITotalNodesNeverSums(t *testing.T) {
+	const nodes, segments = 3, 95
+	seg := SegmentedAPIMetrics{
+		Interval:  900,
+		FirstTime: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC),
+		Segments:  make([]APIStats, segments),
+	}
+	for i := range seg.Segments {
+		seg.Segments[i] = APIStats{Nodes: nodes, Requests: 100}
+	}
+
+	total := SegmentedAPITotal(seg)
+	if total.Nodes != nodes {
+		t.Errorf("Nodes = %d, want %d (summed across %d segments)", total.Nodes, nodes, segments)
+	}
+	// Requests really are a cross-segment sum and must not be reset.
+	if want := int64(segments * 100); total.Requests != want {
+		t.Errorf("Requests = %d, want %d", total.Requests, want)
+	}
+}
+
+// A node that joined or left mid-window reported only some segments, so the fold
+// keeps the widest single observation rather than the first or last.
+func TestSegmentedAPITotalNodesUsesWidestSegment(t *testing.T) {
+	seg := SegmentedAPIMetrics{
+		Interval: 900,
+		Segments: []APIStats{
+			{Nodes: 1, Requests: 10},
+			{Nodes: 3, Requests: 10},
+			{Nodes: 2, Requests: 10},
+		},
+	}
+	if got := SegmentedAPITotal(seg).Nodes; got != 3 {
+		t.Errorf("Nodes = %d, want 3", got)
+	}
+}
+
+func TestSegmentedAPITotalEmpty(t *testing.T) {
+	total := SegmentedAPITotal(SegmentedAPIMetrics{})
+	if total.Nodes != 0 || total.Requests != 0 {
+		t.Errorf("empty fold = %+v, want zero value", total)
+	}
+}
+
+// TestReplicationMetricsMerge tests ReplicationMetrics.Merge functionality
+func TestReplicationMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *ReplicationMetrics
+		other  *ReplicationMetrics
+		verify func(t *testing.T, result *ReplicationMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &ReplicationMetrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *ReplicationMetrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge basic fields",
+			base: &ReplicationMetrics{
+				CollectedAt: now,
+				Nodes:       2,
+				Active:      100,
+				Queued:      50,
+			},
+			other: &ReplicationMetrics{
+				CollectedAt: later,
+				Nodes:       3,
+				Active:      150,
+				Queued:      75,
+			},
+			verify: func(t *testing.T, result *ReplicationMetrics) {
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				if result.Active != 250 {
+					t.Errorf("Active = %d, want 250", result.Active)
+				}
+				if result.Queued != 125 {
+					t.Errorf("Queued = %d, want 125", result.Queued)
+				}
+			},
+		},
+		{
+			name: "merge Targets map - nil base",
+			base: &ReplicationMetrics{
+				CollectedAt: now,
+				Nodes:       2,
+			},
+			other: &ReplicationMetrics{
+				CollectedAt: later,
+				Nodes:       3,
+				Targets: map[string]ReplicationTargetStats{
+					"target1": {
+						Nodes:      2,
+						LastHour:   ReplicationStats{Nodes: 2, Events: 100, Bytes: 1000, LatencySecs: 10.5, MaxLatencySecs: 5.2},
+						SinceStart: ReplicationStats{Nodes: 2, Events: 500, Bytes: 5000},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *ReplicationMetrics) {
+				if result.Targets == nil {
+					t.Fatal("Targets should not be nil after merge")
+				}
+				if len(result.Targets) != 1 {
+					t.Errorf("Targets length = %d, want 1", len(result.Targets))
+				}
+				target1 := result.Targets["target1"]
+				if target1.Nodes != 2 {
+					t.Errorf("Targets[target1].Nodes = %d, want 2", target1.Nodes)
+				}
+				if target1.LastHour.LatencySecs != 10.5 {
+					t.Errorf("Targets[target1].LastHour.LatencySecs = %f, want 10.5", target1.LastHour.LatencySecs)
+				}
+				if target1.LastHour.MaxLatencySecs != 5.2 {
+					t.Errorf("Targets[target1].LastHour.MaxLatencySecs = %f, want 5.2", target1.LastHour.MaxLatencySecs)
+				}
+				if target1.LastHour.Events != 100 {
+					t.Errorf("Targets[target1].LastHour.Events = %d, want 100", target1.LastHour.Events)
+				}
+				if target1.SinceStart.Events != 500 {
+					t.Errorf("Targets[target1].SinceStart.Events = %d, want 500", target1.SinceStart.Events)
+				}
+			},
+		},
+		{
+			name: "merge Targets map - accumulate existing",
+			base: &ReplicationMetrics{
+				Targets: map[string]ReplicationTargetStats{
+					"target1": {
+						Nodes:      2,
+						LastHour:   ReplicationStats{Nodes: 2, Events: 100, Bytes: 1000, LatencySecs: 10.0, MaxLatencySecs: 4.0},
+						SinceStart: ReplicationStats{Nodes: 2, Events: 200, Bytes: 2000},
+					},
+					"target2": {
+						Nodes:      1,
+						LastHour:   ReplicationStats{Nodes: 1, Events: 50, Bytes: 500, LatencySecs: 5.0, MaxLatencySecs: 3.0},
+						SinceStart: ReplicationStats{Nodes: 1, Events: 150, Bytes: 1500},
+					},
+				},
+			},
+			other: &ReplicationMetrics{
+				Targets: map[string]ReplicationTargetStats{
+					"target1": {
+						Nodes:      3,
+						LastHour:   ReplicationStats{Nodes: 3, Events: 200, Bytes: 2000, LatencySecs: 15.0, MaxLatencySecs: 6.0},
+						SinceStart: ReplicationStats{Nodes: 3, Events: 300, Bytes: 3000},
+					},
+					"target3": {
+						Nodes:      1,
+						LastHour:   ReplicationStats{Nodes: 1, Events: 25, Bytes: 250, LatencySecs: 8.0, MaxLatencySecs: 7.0},
+						SinceStart: ReplicationStats{Nodes: 1, Events: 75, Bytes: 750},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *ReplicationMetrics) {
+				if len(result.Targets) != 3 {
+					t.Errorf("Targets length = %d, want 3", len(result.Targets))
+				}
+
+				// Check target1 (merged)
+				target1 := result.Targets["target1"]
+				if target1.Nodes != 5 { // 2 + 3
+					t.Errorf("Targets[target1].Nodes = %d, want 5", target1.Nodes)
+				}
+				if target1.LastHour.LatencySecs != 25.0 { // 10 + 15
+					t.Errorf("Targets[target1].LastHour.LatencySecs = %f, want 25.0", target1.LastHour.LatencySecs)
+				}
+				if target1.LastHour.MaxLatencySecs != 6.0 { // max(4, 6)
+					t.Errorf("Targets[target1].LastHour.MaxLatencySecs = %f, want 6.0", target1.LastHour.MaxLatencySecs)
+				}
+				if target1.LastHour.Events != 300 { // 100 + 200
+					t.Errorf("Targets[target1].LastHour.Events = %d, want 300", target1.LastHour.Events)
+				}
+				if target1.SinceStart.Events != 500 { // 200 + 300
+					t.Errorf("Targets[target1].SinceStart.Events = %d, want 500", target1.SinceStart.Events)
+				}
+
+				// Check target2 (unchanged)
+				target2 := result.Targets["target2"]
+				if target2.Nodes != 1 {
+					t.Errorf("Targets[target2].Nodes = %d, want 1", target2.Nodes)
+				}
+				if target2.LastHour.Events != 50 {
+					t.Errorf("Targets[target2].LastHour.Events = %d, want 50", target2.LastHour.Events)
+				}
+
+				// Check target3 (new)
+				target3 := result.Targets["target3"]
+				if target3.Nodes != 1 {
+					t.Errorf("Targets[target3].Nodes = %d, want 1", target3.Nodes)
+				}
+				if target3.LastHour.Events != 25 {
+					t.Errorf("Targets[target3].LastHour.Events = %d, want 25", target3.LastHour.Events)
+				}
+			},
+		},
+		{
+			name: "merge with empty Targets in other",
+			base: &ReplicationMetrics{
+				Targets: map[string]ReplicationTargetStats{
+					"target1": {
+						Nodes:      1,
+						LastHour:   ReplicationStats{Nodes: 1, Events: 100},
+						SinceStart: ReplicationStats{Nodes: 1, Events: 500},
+					},
+				},
+			},
+			other: &ReplicationMetrics{
+				Nodes:  2,
+				Active: 50,
+			},
+			verify: func(t *testing.T, result *ReplicationMetrics) {
+				// Targets should remain unchanged
+				if len(result.Targets) != 1 {
+					t.Errorf("Targets length = %d, want 1", len(result.Targets))
+				}
+				if result.Targets["target1"].Nodes != 1 {
+					t.Errorf("Targets[target1].Nodes = %d, want 1", result.Targets["target1"].Nodes)
+				}
+				if result.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", result.Nodes)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestReplicationTargetStatsMerge tests ReplicationTargetStats.Merge functionality
+func TestReplicationTargetStatsMerge(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name   string
+		base   *ReplicationTargetStats
+		other  *ReplicationTargetStats
+		verify func(t *testing.T, result *ReplicationTargetStats)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &ReplicationTargetStats{Nodes: 2},
+			other: nil,
+			verify: func(t *testing.T, result *ReplicationTargetStats) {
+				if result.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", result.Nodes)
+				}
+			},
+		},
+		{
+			name: "merge with zero nodes other",
+			base: &ReplicationTargetStats{
+				Nodes:    2,
+				LastHour: ReplicationStats{Events: 100},
+			},
+			other: &ReplicationTargetStats{
+				Nodes:    0,
+				LastHour: ReplicationStats{Events: 200},
+			},
+			verify: func(t *testing.T, result *ReplicationTargetStats) {
+				if result.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", result.Nodes)
+				}
+				if result.LastHour.Events != 100 {
+					t.Errorf("LastHour.Events = %d, want 100", result.LastHour.Events)
+				}
+			},
+		},
+		{
+			name: "merge basic stats",
+			base: &ReplicationTargetStats{
+				Nodes: 2,
+				LastHour: ReplicationStats{
+					Nodes:          2,
+					Events:         100,
+					Bytes:          1000,
+					LatencySecs:    10.0,
+					MaxLatencySecs: 5.0,
+				},
+				SinceStart: ReplicationStats{
+					Nodes:  2,
+					Events: 500,
+					Bytes:  5000,
+				},
+			},
+			other: &ReplicationTargetStats{
+				Nodes: 3,
+				LastHour: ReplicationStats{
+					Nodes:          3,
+					Events:         200,
+					Bytes:          2000,
+					LatencySecs:    15.0,
+					MaxLatencySecs: 7.0,
+				},
+				SinceStart: ReplicationStats{
+					Nodes:  3,
+					Events: 700,
+					Bytes:  7000,
+				},
+			},
+			verify: func(t *testing.T, result *ReplicationTargetStats) {
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				if result.LastHour.Events != 300 {
+					t.Errorf("LastHour.Events = %d, want 300", result.LastHour.Events)
+				}
+				if result.LastHour.Bytes != 3000 {
+					t.Errorf("LastHour.Bytes = %d, want 3000", result.LastHour.Bytes)
+				}
+				if result.LastHour.LatencySecs != 25.0 {
+					t.Errorf("LastHour.LatencySecs = %f, want 25.0", result.LastHour.LatencySecs)
+				}
+				if result.LastHour.MaxLatencySecs != 7.0 {
+					t.Errorf("LastHour.MaxLatencySecs = %f, want 7.0", result.LastHour.MaxLatencySecs)
+				}
+				if result.SinceStart.Events != 1200 {
+					t.Errorf("SinceStart.Events = %d, want 1200", result.SinceStart.Events)
+				}
+			},
+		},
+		{
+			name: "merge with LastDay segmented stats",
+			base: &ReplicationTargetStats{
+				Nodes: 1,
+			},
+			other: &ReplicationTargetStats{
+				Nodes: 1,
+				LastDay: &SegmentedReplicationStats{
+					Segments: []ReplicationStats{
+						{Events: 1000, Bytes: 10000},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *ReplicationTargetStats) {
+				if result.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", result.Nodes)
+				}
+				if result.LastDay == nil {
+					t.Fatal("LastDay should not be nil after merge")
+				}
+				if len(result.LastDay.Segments) != 1 {
+					t.Errorf("LastDay.Segments length = %d, want 1", len(result.LastDay.Segments))
+				}
+				if result.LastDay.Segments[0].Events != 1000 {
+					t.Errorf("LastDay.Segments[0].Events = %d, want 1000", result.LastDay.Segments[0].Events)
+				}
+			},
+		},
+		{
+			name: "merge both with LastDay",
+			base: &ReplicationTargetStats{
+				Nodes: 1,
+				LastDay: &SegmentedReplicationStats{
+					Interval:  60,
+					FirstTime: now,
+					Segments: []ReplicationStats{
+						{Nodes: 1, Events: 500, Bytes: 5000},
+					},
+				},
+			},
+			other: &ReplicationTargetStats{
+				Nodes: 1,
+				LastDay: &SegmentedReplicationStats{
+					Interval:  60,
+					FirstTime: now,
+					Segments: []ReplicationStats{
+						{Nodes: 1, Events: 700, Bytes: 7000},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *ReplicationTargetStats) {
+				if result.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", result.Nodes)
+				}
+				if result.LastDay == nil {
+					t.Fatal("LastDay should not be nil after merge")
+				}
+				// After merge with same FirstTime and Interval, segments should be merged
+				totalEvents := int64(0)
+				for _, seg := range result.LastDay.Segments {
+					totalEvents += seg.Events
+				}
+				if totalEvents != 1200 {
+					t.Errorf("Total events in LastDay.Segments = %d, want 1200", totalEvents)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// AllTargets folds along the target axis, where the same nodes report every
+// target: 46 targets on a 3-node cluster must report 3, not 138.
+func TestAllTargetsNodesNeverSums(t *testing.T) {
+	const nodes, targets = 3, 46
+	m := &ReplicationMetrics{
+		Nodes:   nodes,
+		Targets: make(map[string]ReplicationTargetStats, targets),
+	}
+	for i := range targets {
+		m.Targets[fmt.Sprintf("peer:bucket-%d", i)] = ReplicationTargetStats{
+			Nodes:      nodes,
+			LastMinute: ReplicationStats{Nodes: nodes, Events: 1},
+			LastHour:   ReplicationStats{Nodes: nodes, Events: 100},
+			SinceStart: ReplicationStats{Nodes: nodes, Events: 1000},
+			LastDay: &SegmentedReplicationStats{
+				Interval: 900,
+				Segments: []ReplicationStats{{Nodes: nodes, Events: 50}},
+			},
+		}
+	}
+
+	all := m.AllTargets()
+	for _, tc := range []struct {
+		name string
+		got  int
+	}{
+		{"Nodes", all.Nodes},
+		{"LastMinute.Nodes", all.LastMinute.Nodes},
+		{"LastHour.Nodes", all.LastHour.Nodes},
+		{"SinceStart.Nodes", all.SinceStart.Nodes},
+	} {
+		if tc.got != nodes {
+			t.Errorf("%s = %d, want %d (summed across %d targets)", tc.name, tc.got, nodes, targets)
+		}
+	}
+	for i, s := range all.LastDay.Segments {
+		if s.Nodes != nodes {
+			t.Errorf("LastDay.Segments[%d].Nodes = %d, want %d", i, s.Nodes, nodes)
+		}
+	}
+
+	// Event counters are additive along the target axis and must be untouched.
+	if want := int64(targets * 100); all.LastHour.Events != want {
+		t.Errorf("LastHour.Events = %d, want %d", all.LastHour.Events, want)
+	}
+}
+
+// Each day segment is bounded on its own: a quarter hour that only some nodes
+// reported must not be rounded up to the whole-window figure. Two targets on a
+// 3-node cluster, second segment reported by one node each, gives 3 for the busy
+// segment and stays under it for the quiet one.
+func TestAllTargetsDayNodesArePerSegment(t *testing.T) {
+	ft := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	day := func() *SegmentedReplicationStats {
+		return &SegmentedReplicationStats{
+			Interval: 900, FirstTime: ft,
+			Segments: []ReplicationStats{
+				{Nodes: 3, Events: 100},
+				{Nodes: 1, Events: 10},
+			},
+		}
+	}
+	m := &ReplicationMetrics{
+		Nodes: 3,
+		Targets: map[string]ReplicationTargetStats{
+			"peer:a": {Nodes: 3, LastHour: ReplicationStats{Nodes: 3, Events: 5}, LastDay: day()},
+			"peer:b": {Nodes: 3, LastHour: ReplicationStats{Nodes: 3, Events: 5}, LastDay: day()},
+		},
+	}
+
+	all := m.AllTargets()
+	// Segment 1 was reported by one node per target; whether that is the same
+	// node is not knowable from counts, so the sum stands where it is under the
+	// responding-node bound.
+	wantNodes := []int{3, 2}
+	wantEvents := []int64{200, 20} // Events really do sum across targets.
+	for i, seg := range all.LastDay.Segments {
+		if seg.Nodes != wantNodes[i] {
+			t.Errorf("LastDay.Segments[%d].Nodes = %d, want %d", i, seg.Nodes, wantNodes[i])
+		}
+		if seg.Events != wantEvents[i] {
+			t.Errorf("LastDay.Segments[%d].Events = %d, want %d", i, seg.Events, wantEvents[i])
+		}
+	}
+}
+
+// Each segment is clamped on its own: one over the bound comes down to it, one
+// under it is left alone, and a slot no target covered stays at zero.
+func TestReplicationDayNodesClampsPerSegment(t *testing.T) {
+	ft := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	dst := &SegmentedReplicationStats{
+		Interval: 900, FirstTime: ft,
+		Segments: []ReplicationStats{
+			{Nodes: 6, Events: 100}, // summed over two targets, above the bound
+			{Nodes: 2, Events: 20},  // already under it
+			{Events: 0},             // uncovered
+		},
+	}
+	ReplicationDayNodes(dst, 3)
+
+	for i, want := range []int{3, 2, 0} {
+		if got := dst.Segments[i].Nodes; got != want {
+			t.Errorf("Segments[%d].Nodes = %d, want %d", i, got, want)
+		}
+	}
+	// Event counters sum across targets and must be untouched.
+	if got := dst.Segments[0].Events; got != 100 {
+		t.Errorf("Segments[0].Events = %d, want 100", got)
+	}
+}
+
+// Targets need not cover the same span: Add builds a unified timeline starting
+// at the earliest FirstTime, and the clamp must apply to those slots as merged.
+func TestReplicationDayNodesOffsetWindows(t *testing.T) {
+	ft := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	early := &SegmentedReplicationStats{
+		Interval: 900, FirstTime: ft,
+		Segments: []ReplicationStats{{Nodes: 2, Events: 1}, {Nodes: 1, Events: 1}},
+	}
+	// Starts one interval later, so its segments land on slots 1 and 2.
+	late := &SegmentedReplicationStats{
+		Interval: 900, FirstTime: ft.Add(15 * time.Minute),
+		Segments: []ReplicationStats{{Nodes: 3, Events: 1}, {Nodes: 1, Events: 1}},
+	}
+
+	var merged SegmentedReplicationStats
+	merged.Add(early)
+	merged.Add(late)
+	ReplicationDayNodes(&merged, 3)
+
+	// Slot 1 summed to 4 across the two windows and comes down to the bound.
+	for i, want := range []int{2, 3, 1} {
+		if got := merged.Segments[i].Nodes; got != want {
+			t.Errorf("Segments[%d].Nodes = %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestReplicationDayNodesNilAndEmpty(t *testing.T) {
+	ReplicationDayNodes(nil, 3) // must not panic
+	empty := &SegmentedReplicationStats{Interval: 900}
+	ReplicationDayNodes(empty, 3)
+	if len(empty.Segments) != 0 {
+		t.Errorf("Segments = %d, want 0", len(empty.Segments))
+	}
+}
+
+// The time-axis counterpart of the above, for the replication family.
+func TestSegmentedReplicationTotalNodesNeverSums(t *testing.T) {
+	const nodes, segments = 3, 96
+	seg := &SegmentedReplicationStats{
+		Interval: 900,
+		Segments: make([]ReplicationStats, segments),
+	}
+	for i := range seg.Segments {
+		seg.Segments[i] = ReplicationStats{Nodes: nodes, Events: 100}
+	}
+
+	total := SegmentedReplicationTotal(seg)
+	if total.Nodes != nodes {
+		t.Errorf("Nodes = %d, want %d (summed across %d segments)", total.Nodes, nodes, segments)
+	}
+	if want := int64(segments * 100); total.Events != want {
+		t.Errorf("Events = %d, want %d", total.Events, want)
+	}
+}
+
+// A nil window is the common case for a target that has never replicated.
+func TestSegmentedReplicationTotalNil(t *testing.T) {
+	total := SegmentedReplicationTotal(nil)
+	if total.Nodes != 0 || total.Events != 0 {
+		t.Errorf("nil fold = %+v, want zero value", total)
+	}
+}
+
+// Targets that no node reported are skipped by Merge and must not drag the node
+// count down.
+func TestAllTargetsIgnoresUnreportedTargets(t *testing.T) {
+	m := &ReplicationMetrics{
+		Nodes: 3,
+		Targets: map[string]ReplicationTargetStats{
+			"peer:live": {Nodes: 3, LastHour: ReplicationStats{Nodes: 3, Events: 7}},
+			"peer:cold": {},
+		},
+	}
+	all := m.AllTargets()
+	if all.Nodes != 3 {
+		t.Errorf("Nodes = %d, want 3", all.Nodes)
+	}
+	if all.LastHour.Events != 7 {
+		t.Errorf("LastHour.Events = %d, want 7", all.LastHour.Events)
+	}
+}
+
+// oneNodeReplication is one node's report: every target it knows about carries
+// Nodes == 1. The day window, when given, is shared by all of that node's
+// targets.
+func oneNodeReplication(day *SegmentedReplicationStats, arns ...string) *ReplicationMetrics {
+	m := &ReplicationMetrics{Nodes: 1, Targets: make(map[string]ReplicationTargetStats, len(arns))}
+	for _, arn := range arns {
+		t := ReplicationTargetStats{
+			Nodes:      1,
+			LastMinute: ReplicationStats{Nodes: 1, Events: 1},
+			LastHour:   ReplicationStats{Nodes: 1, Events: 100},
+			SinceStart: ReplicationStats{Nodes: 1, Events: 1000},
+		}
+		if day != nil {
+			cp := *day
+			cp.Segments = append([]ReplicationStats(nil), day.Segments...)
+			t.LastDay = &cp
+		}
+		m.Targets[arn] = t
+	}
+	return m
+}
+
+func checkAllTargetNodes(t *testing.T, all ReplicationTargetStats, want int) {
+	t.Helper()
+	for _, tc := range []struct {
+		name string
+		got  int
+	}{
+		{"Nodes", all.Nodes},
+		{"LastMinute.Nodes", all.LastMinute.Nodes},
+		{"LastHour.Nodes", all.LastHour.Nodes},
+		{"SinceStart.Nodes", all.SinceStart.Nodes},
+	} {
+		if tc.got != want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, want)
+		}
+	}
+}
+
+// A node gains a map entry for a target only once it has processed an event for
+// it, so reporter sets differ per target. Two nodes reporting one target each
+// leave every target at Nodes == 1 while two distinct nodes contributed to the
+// aggregate: the per-target maximum used to return 1.
+func TestAllTargetsDisjointReporters(t *testing.T) {
+	day := &SegmentedReplicationStats{
+		Interval: 900, FirstTime: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC),
+		Segments: []ReplicationStats{{Nodes: 1, Events: 50}},
+	}
+
+	var m ReplicationMetrics
+	m.Merge(oneNodeReplication(day, "peer:a"))
+	m.Merge(oneNodeReplication(day, "peer:b"))
+
+	all := m.AllTargets()
+	checkAllTargetNodes(t, all, 2)
+	if got := all.LastDay.Segments[0].Nodes; got != 2 {
+		t.Errorf("LastDay.Segments[0].Nodes = %d, want 2", got)
+	}
+	// The per-target view is untouched: one node really did report each.
+	for _, arn := range []string{"peer:a", "peer:b"} {
+		if got := m.Targets[arn].Nodes; got != 1 {
+			t.Errorf("Targets[%s].Nodes = %d, want 1", arn, got)
+		}
+	}
+	// Event counters still sum along both axes.
+	if all.LastHour.Events != 200 {
+		t.Errorf("LastHour.Events = %d, want 200", all.LastHour.Events)
+	}
+}
+
+// Partially overlapping reporter sets. Three nodes: n1 reports both targets, n2
+// only peer:a, n3 only peer:b -- so each target has two reporters while three
+// nodes contributed. The per-target maximum used to return 2.
+func TestAllTargetsPartiallyOverlappingReporters(t *testing.T) {
+	day := &SegmentedReplicationStats{
+		Interval: 900, FirstTime: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC),
+		Segments: []ReplicationStats{{Nodes: 1, Events: 10}, {Nodes: 1, Events: 10}},
+	}
+
+	var m ReplicationMetrics
+	m.Merge(oneNodeReplication(day, "peer:a", "peer:b"))
+	m.Merge(oneNodeReplication(day, "peer:a"))
+	m.Merge(oneNodeReplication(day, "peer:b"))
+
+	all := m.AllTargets()
+	checkAllTargetNodes(t, all, 3)
+
+	// Each slot summed to 4 across the four (node, target) windows covering it
+	// and comes down to the three nodes that responded. Events keep the sum.
+	for i, seg := range all.LastDay.Segments {
+		if seg.Nodes != 3 {
+			t.Errorf("LastDay.Segments[%d].Nodes = %d, want 3", i, seg.Nodes)
+		}
+		if seg.Events != 40 {
+			t.Errorf("LastDay.Segments[%d].Events = %d, want 40", i, seg.Events)
+		}
+	}
+}
+
+// The bound is the responding node count, so it overcounts when few nodes hold
+// many targets each: one node with three targets in a cluster where three
+// responded reports 3, not 1. Pinned deliberately -- the alternative, the
+// per-target maximum, undercounts the cases above, and counts alone cannot
+// separate the two.
+func TestAllTargetsClampOvercountsIdleNodes(t *testing.T) {
+	var m ReplicationMetrics
+	m.Merge(oneNodeReplication(nil, "peer:a", "peer:b", "peer:c"))
+	m.Merge(&ReplicationMetrics{Nodes: 1}) // responded, has processed nothing
+	m.Merge(&ReplicationMetrics{Nodes: 1})
+
+	if m.Nodes != 3 {
+		t.Fatalf("Nodes = %d, want 3: nodes without targets still responded", m.Nodes)
+	}
+	checkAllTargetNodes(t, m.AllTargets(), 3)
+}
+
+// Without a responding node count to bound the sum, fall back to the per-target
+// maximum rather than zeroing every count.
+func TestAllTargetsWithoutNodeCount(t *testing.T) {
+	m := &ReplicationMetrics{
+		Targets: map[string]ReplicationTargetStats{
+			"peer:a": {Nodes: 2, LastHour: ReplicationStats{Nodes: 2, Events: 7}},
+			"peer:b": {Nodes: 2, LastHour: ReplicationStats{Nodes: 2, Events: 7}},
+		},
+	}
+	all := m.AllTargets()
+	if all.Nodes != 2 {
+		t.Errorf("Nodes = %d, want 2", all.Nodes)
+	}
+	if all.LastHour.Events != 14 {
+		t.Errorf("LastHour.Events = %d, want 14", all.LastHour.Events)
+	}
+}
+
+// TestReplicationStatsAdd tests ReplicationStats.Add functionality
+func TestReplicationStatsAdd(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *ReplicationStats
+		other  *ReplicationStats
+		verify func(t *testing.T, result *ReplicationStats)
+	}{
+		{
+			name:  "add nil other",
+			base:  &ReplicationStats{},
+			other: nil,
+			verify: func(_ *testing.T, _ *ReplicationStats) {
+				// Should not panic
+			},
+		},
+		{
+			name: "add all fields",
+			base: &ReplicationStats{
+				Nodes:            2,
+				StartTime:        &now,
+				EndTime:          &later,
+				WallTimeSecs:     100,
+				Events:           1000,
+				Bytes:            10000,
+				EventTimeSecs:    50,
+				PutObject:        500,
+				UpdateMeta:       50,
+				DelObject:        300,
+				DelTag:           30,
+				LatencySecs:      10.0,
+				MaxLatencySecs:   5.0,
+				PutErrors:        10,
+				UpdateMetaErrors: 5,
+				DelErrors:        8,
+				DelTagErrors:     2,
+				Synced:           800,
+				AlreadyOK:        100,
+				Rejected:         50,
+				ProxyEvents:      20,
+				ProxyBytes:       2000,
+				ProxyHead:        5,
+				ProxyGet:         10,
+				ProxyGetTag:      5,
+				ProxyGetOK:       8,
+				ProxyGetTagOK:    4,
+				ProxyHeadOK:      3,
+			},
+			other: &ReplicationStats{
+				Nodes:            3,
+				StartTime:        &now,
+				EndTime:          &later,
+				WallTimeSecs:     150,
+				Events:           2000,
+				Bytes:            20000,
+				EventTimeSecs:    75,
+				PutObject:        1000,
+				UpdateMeta:       100,
+				DelObject:        600,
+				DelTag:           60,
+				LatencySecs:      15.0,
+				MaxLatencySecs:   7.0,
+				PutErrors:        20,
+				UpdateMetaErrors: 10,
+				DelErrors:        15,
+				DelTagErrors:     5,
+				Synced:           1600,
+				AlreadyOK:        200,
+				Rejected:         100,
+				ProxyEvents:      40,
+				ProxyBytes:       4000,
+				ProxyHead:        10,
+				ProxyGet:         20,
+				ProxyGetTag:      10,
+				ProxyGetOK:       16,
+				ProxyGetTagOK:    8,
+				ProxyHeadOK:      7,
+			},
+			verify: func(t *testing.T, result *ReplicationStats) {
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				if result.WallTimeSecs != 250 {
+					t.Errorf("WallTimeSecs = %f, want 250", result.WallTimeSecs)
+				}
+				if result.Events != 3000 {
+					t.Errorf("Events = %d, want 3000", result.Events)
+				}
+				if result.Bytes != 30000 {
+					t.Errorf("Bytes = %d, want 30000", result.Bytes)
+				}
+				if result.EventTimeSecs != 125 {
+					t.Errorf("EventTimeSecs = %f, want 125", result.EventTimeSecs)
+				}
+				if result.LatencySecs != 25.0 {
+					t.Errorf("LatencySecs = %f, want 25.0", result.LatencySecs)
+				}
+				if result.MaxLatencySecs != 7.0 {
+					t.Errorf("MaxLatencySecs = %f, want 7.0", result.MaxLatencySecs)
+				}
+				if result.PutObject != 1500 {
+					t.Errorf("PutObject = %d, want 1500", result.PutObject)
+				}
+				if result.UpdateMeta != 150 {
+					t.Errorf("UpdateMeta = %d, want 150", result.UpdateMeta)
+				}
+				if result.DelObject != 900 {
+					t.Errorf("DelObject = %d, want 900", result.DelObject)
+				}
+				if result.DelTag != 90 {
+					t.Errorf("DelTag = %d, want 90", result.DelTag)
+				}
+				if result.PutErrors != 30 {
+					t.Errorf("PutErrors = %d, want 30", result.PutErrors)
+				}
+				if result.UpdateMetaErrors != 15 {
+					t.Errorf("UpdateMetaErrors = %d, want 15", result.UpdateMetaErrors)
+				}
+				if result.DelErrors != 23 {
+					t.Errorf("DelErrors = %d, want 23", result.DelErrors)
+				}
+				if result.DelTagErrors != 7 {
+					t.Errorf("DelTagErrors = %d, want 7", result.DelTagErrors)
+				}
+				if result.Synced != 2400 {
+					t.Errorf("Synced = %d, want 2400", result.Synced)
+				}
+				if result.AlreadyOK != 300 {
+					t.Errorf("AlreadyOK = %d, want 300", result.AlreadyOK)
+				}
+				if result.Rejected != 150 {
+					t.Errorf("Rejected = %d, want 150", result.Rejected)
+				}
+				if result.ProxyEvents != 60 {
+					t.Errorf("ProxyEvents = %d, want 60", result.ProxyEvents)
+				}
+				if result.ProxyBytes != 6000 {
+					t.Errorf("ProxyBytes = %d, want 6000", result.ProxyBytes)
+				}
+				if result.ProxyHead != 15 {
+					t.Errorf("ProxyHead = %d, want 15", result.ProxyHead)
+				}
+				if result.ProxyGet != 30 {
+					t.Errorf("ProxyGet = %d, want 30", result.ProxyGet)
+				}
+				if result.ProxyGetTag != 15 {
+					t.Errorf("ProxyGetTag = %d, want 15", result.ProxyGetTag)
+				}
+				if result.ProxyGetOK != 24 {
+					t.Errorf("ProxyGetOK = %d, want 24", result.ProxyGetOK)
+				}
+				if result.ProxyGetTagOK != 12 {
+					t.Errorf("ProxyGetTagOK = %d, want 12", result.ProxyGetTagOK)
+				}
+				if result.ProxyHeadOK != 10 {
+					t.Errorf("ProxyHeadOK = %d, want 10", result.ProxyHeadOK)
+				}
+			},
+		},
+		{
+			name: "different timestamps should nullify",
+			base: &ReplicationStats{
+				Nodes:     1,
+				StartTime: &now,
+				EndTime:   &now,
+				Events:    100,
+			},
+			other: &ReplicationStats{
+				Nodes:     1,
+				StartTime: &later,
+				EndTime:   &later,
+				Events:    200,
+			},
+			verify: func(t *testing.T, result *ReplicationStats) {
+				if result.StartTime != nil {
+					t.Error("StartTime should be nil when timestamps differ")
+				}
+				if result.EndTime != nil {
+					t.Error("EndTime should be nil when timestamps differ")
+				}
+				if result.Events != 300 {
+					t.Errorf("Events = %d, want 300", result.Events)
+				}
+			},
+		},
+		{
+			name: "skip when other has zero nodes",
+			base: &ReplicationStats{
+				Nodes:  1,
+				Events: 100,
+			},
+			other: &ReplicationStats{
+				Nodes:  0,
+				Events: 200,
+			},
+			verify: func(t *testing.T, result *ReplicationStats) {
+				if result.Nodes != 1 {
+					t.Errorf("Nodes = %d, want 1", result.Nodes)
+				}
+				if result.Events != 100 {
+					t.Errorf("Events = %d, want 100", result.Events)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Add(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestMetricsMerge tests the top-level Metrics.Merge functionality
+func TestMetricsMerge(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   *Metrics
+		other  *Metrics
+		verify func(t *testing.T, result *Metrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &Metrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *Metrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge all non-nil fields",
+			base: &Metrics{
+				Scanner:     &ScannerMetrics{OngoingBuckets: 5},
+				Disk:        &DiskMetric{NDisks: 10},
+				OS:          &OSMetrics{},
+				BatchJobs:   &BatchJobMetrics{},
+				SiteResync:  &SiteResyncMetrics{NumBuckets: 20},
+				Net:         &NetMetrics{},
+				Mem:         &MemMetrics{},
+				CPU:         &CPUMetrics{CPUCount: 4},
+				RPC:         &RPCMetrics{Nodes: 2, ConnectionStats: ConnectionStats{Connected: 5}},
+				Go:          &RuntimeMetrics{N: 1},
+				API:         &APIMetrics{Nodes: 3},
+				Replication: &ReplicationMetrics{Active: 100},
+			},
+			other: &Metrics{
+				Scanner:     &ScannerMetrics{OngoingBuckets: 3},
+				Disk:        &DiskMetric{NDisks: 5},
+				OS:          &OSMetrics{},
+				BatchJobs:   &BatchJobMetrics{},
+				SiteResync:  &SiteResyncMetrics{NumBuckets: 10},
+				Net:         &NetMetrics{},
+				Mem:         &MemMetrics{},
+				CPU:         &CPUMetrics{CPUCount: 4},
+				RPC:         &RPCMetrics{Nodes: 3, ConnectionStats: ConnectionStats{Connected: 3}},
+				Go:          &RuntimeMetrics{N: 1},
+				API:         &APIMetrics{Nodes: 2},
+				Replication: &ReplicationMetrics{Active: 50},
+			},
+			verify: func(t *testing.T, result *Metrics) {
+				if result.Scanner.OngoingBuckets != 5 {
+					t.Errorf("Scanner.OngoingBuckets = %d, want 5", result.Scanner.OngoingBuckets)
+				}
+				if result.Disk.NDisks != 15 {
+					t.Errorf("Disk.NDisks = %d, want 15", result.Disk.NDisks)
+				}
+				if result.CPU.CPUCount != 8 {
+					t.Errorf("CPU.CPUCount = %d, want 8", result.CPU.CPUCount)
+				}
+				if result.RPC.Nodes != 5 {
+					t.Errorf("RPC.Nodes = %d, want 5", result.RPC.Nodes)
+				}
+				if result.RPC.Connected != 8 {
+					t.Errorf("RPC.Connected = %d, want 8", result.RPC.Connected)
+				}
+				if result.Go.N != 2 {
+					t.Errorf("Go.N = %d, want 2", result.Go.N)
+				}
+				if result.API.Nodes != 5 {
+					t.Errorf("API.Nodes = %d, want 5", result.API.Nodes)
+				}
+				if result.Replication.Active != 150 {
+					t.Errorf("Replication.Active = %d, want 150", result.Replication.Active)
+				}
+			},
+		},
+		{
+			name: "merge with nil base fields",
+			base: &Metrics{},
+			other: &Metrics{
+				Scanner:     &ScannerMetrics{OngoingBuckets: 5},
+				Disk:        &DiskMetric{NDisks: 10},
+				CPU:         &CPUMetrics{CPUCount: 4},
+				Replication: &ReplicationMetrics{Active: 100},
+			},
+			verify: func(t *testing.T, result *Metrics) {
+				if result.Scanner == nil {
+					t.Error("Scanner should not be nil")
+				}
+				if result.Scanner != nil && result.Scanner.OngoingBuckets != 5 {
+					t.Errorf("Scanner.OngoingBuckets = %d, want 5", result.Scanner.OngoingBuckets)
+				}
+				if result.Disk == nil {
+					t.Error("Disk should not be nil")
+				}
+				if result.Disk != nil && result.Disk.NDisks != 10 {
+					t.Errorf("Disk.NDisks = %d, want 10", result.Disk.NDisks)
+				}
+				if result.CPU == nil {
+					t.Error("CPU should not be nil")
+				}
+				if result.CPU != nil && result.CPU.CPUCount != 4 {
+					t.Errorf("CPU.CPUCount = %d, want 4", result.CPU.CPUCount)
+				}
+				if result.Replication == nil {
+					t.Error("Replication should not be nil")
+				}
+				if result.Replication != nil && result.Replication.Active != 100 {
+					t.Errorf("Replication.Active = %d, want 100", result.Replication.Active)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestRealtimeMetricsMerge tests RealtimeMetrics.Merge functionality
+func TestRealtimeMetricsMerge(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   *RealtimeMetrics
+		other  *RealtimeMetrics
+		verify func(t *testing.T, result *RealtimeMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &RealtimeMetrics{},
+			other: nil,
+			verify: func(_ *testing.T, _ *RealtimeMetrics) {
+				// Should not panic
+			},
+		},
+		{
+			name: "merge errors",
+			base: &RealtimeMetrics{
+				Errors: []string{"error1"},
+			},
+			other: &RealtimeMetrics{
+				Errors: []string{"error2", "error3"},
+			},
+			verify: func(t *testing.T, result *RealtimeMetrics) {
+				if len(result.Errors) != 3 {
+					t.Errorf("Errors length = %d, want 3", len(result.Errors))
+				}
+				expected := []string{"error1", "error2", "error3"}
+				if !reflect.DeepEqual(result.Errors, expected) {
+					t.Errorf("Errors = %v, want %v", result.Errors, expected)
+				}
+			},
+		},
+		{
+			name: "merge hosts",
+			base: &RealtimeMetrics{
+				Hosts: []string{"host1", "host2"},
+			},
+			other: &RealtimeMetrics{
+				Hosts: []string{"host3", "host1"},
+			},
+			verify: func(t *testing.T, result *RealtimeMetrics) {
+				if len(result.Hosts) != 4 {
+					t.Errorf("Hosts length = %d, want 4", len(result.Hosts))
+				}
+				// Should be sorted
+				expected := []string{"host1", "host1", "host2", "host3"}
+				if !reflect.DeepEqual(result.Hosts, expected) {
+					t.Errorf("Hosts = %v, want %v", result.Hosts, expected)
+				}
+			},
+		},
+		{
+			name: "merge ByHost maps",
+			base: &RealtimeMetrics{
+				ByHost: map[string]Metrics{
+					"host1": {Scanner: &ScannerMetrics{OngoingBuckets: 5}},
+				},
+			},
+			other: &RealtimeMetrics{
+				ByHost: map[string]Metrics{
+					"host2": {Scanner: &ScannerMetrics{OngoingBuckets: 3}},
+				},
+			},
+			verify: func(t *testing.T, result *RealtimeMetrics) {
+				if len(result.ByHost) != 2 {
+					t.Errorf("ByHost length = %d, want 2", len(result.ByHost))
+				}
+				if result.ByHost["host1"].Scanner.OngoingBuckets != 5 {
+					t.Errorf("ByHost[host1].Scanner.OngoingBuckets = %d, want 5", result.ByHost["host1"].Scanner.OngoingBuckets)
+				}
+				if result.ByHost["host2"].Scanner.OngoingBuckets != 3 {
+					t.Errorf("ByHost[host2].Scanner.OngoingBuckets = %d, want 3", result.ByHost["host2"].Scanner.OngoingBuckets)
+				}
+			},
+		},
+		{
+			name: "merge ByDiskSet nested maps",
+			base: &RealtimeMetrics{
+				ByDiskSet: map[int]map[int]DiskMetric{
+					0: {
+						0: {NDisks: 4},
+						1: {NDisks: 4},
+					},
+				},
+			},
+			other: &RealtimeMetrics{
+				ByDiskSet: map[int]map[int]DiskMetric{
+					0: {
+						1: {NDisks: 2},
+						2: {NDisks: 4},
+					},
+					1: {
+						0: {NDisks: 4},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *RealtimeMetrics) {
+				if len(result.ByDiskSet) != 2 {
+					t.Errorf("ByDiskSet length = %d, want 2", len(result.ByDiskSet))
+				}
+				if result.ByDiskSet[0][0].NDisks != 4 {
+					t.Errorf("ByDiskSet[0][0].NDisks = %d, want 4", result.ByDiskSet[0][0].NDisks)
+				}
+				if result.ByDiskSet[0][1].NDisks != 6 { // 4 + 2
+					t.Errorf("ByDiskSet[0][1].NDisks = %d, want 6", result.ByDiskSet[0][1].NDisks)
+				}
+				if result.ByDiskSet[0][2].NDisks != 4 {
+					t.Errorf("ByDiskSet[0][2].NDisks = %d, want 4", result.ByDiskSet[0][2].NDisks)
+				}
+				if result.ByDiskSet[1][0].NDisks != 4 {
+					t.Errorf("ByDiskSet[1][0].NDisks = %d, want 4", result.ByDiskSet[1][0].NDisks)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestRPCStatsMerge tests RPCStats.Merge functionality
+func TestRPCStatsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *RPCStats
+		other  *RPCStats
+		verify func(t *testing.T, result *RPCStats)
+	}{
+		{
+			name: "merge basic fields",
+			base: &RPCStats{
+				StartTime:       &now,
+				EndTime:         &now,
+				WallTimeSecs:    10.0,
+				Requests:        100,
+				RequestTimeSecs: 10.0,
+				IncomingBytes:   1000,
+				OutgoingBytes:   2000,
+			},
+			other: &RPCStats{
+				StartTime:       &now,
+				EndTime:         &now,
+				WallTimeSecs:    15.0,
+				Requests:        200,
+				RequestTimeSecs: 15.0,
+				IncomingBytes:   1500,
+				OutgoingBytes:   2500,
+			},
+			verify: func(t *testing.T, result *RPCStats) {
+				if result.WallTimeSecs != 25.0 {
+					t.Errorf("WallTimeSecs = %f, want 25.0", result.WallTimeSecs)
+				}
+				if result.Requests != 300 {
+					t.Errorf("Requests = %d, want 300", result.Requests)
+				}
+				if result.RequestTimeSecs != 25.0 {
+					t.Errorf("RequestTimeSecs = %f, want 25.0", result.RequestTimeSecs)
+				}
+				if result.IncomingBytes != 2500 {
+					t.Errorf("IncomingBytes = %d, want 2500", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 4500 {
+					t.Errorf("OutgoingBytes = %d, want 4500", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "merge with same timestamps",
+			base: &RPCStats{
+				StartTime: &now,
+				EndTime:   &later,
+				Requests:  100,
+			},
+			other: &RPCStats{
+				StartTime: &now,
+				EndTime:   &later,
+				Requests:  200,
+			},
+			verify: func(t *testing.T, result *RPCStats) {
+				if result.StartTime == nil || !result.StartTime.Equal(now) {
+					t.Error("StartTime should be preserved when times are equal")
+				}
+				if result.EndTime == nil || !result.EndTime.Equal(later) {
+					t.Error("EndTime should be preserved when times are equal")
+				}
+				if result.Requests != 300 {
+					t.Errorf("Requests = %d, want 300", result.Requests)
+				}
+			},
+		},
+		{
+			name: "merge different start/end times - should nullify",
+			base: &RPCStats{
+				StartTime: &now,
+				EndTime:   &now,
+				Requests:  100,
+			},
+			other: &RPCStats{
+				StartTime: &later,
+				EndTime:   &later,
+				Requests:  200,
+			},
+			verify: func(t *testing.T, result *RPCStats) {
+				if result.StartTime != nil {
+					t.Error("StartTime should be nil when merging different times")
+				}
+				if result.EndTime != nil {
+					t.Error("EndTime should be nil when merging different times")
+				}
+				if result.Requests != 300 {
+					t.Errorf("Requests = %d, want 300", result.Requests)
+				}
+			},
+		},
+		{
+			name: "merge with nil timestamps",
+			base: &RPCStats{
+				Requests:        100,
+				IncomingBytes:   1000,
+				OutgoingBytes:   2000,
+				RequestTimeSecs: 5.0,
+				WallTimeSecs:    10.0,
+			},
+			other: &RPCStats{
+				Requests:        50,
+				IncomingBytes:   500,
+				OutgoingBytes:   1000,
+				RequestTimeSecs: 2.5,
+				WallTimeSecs:    5.0,
+			},
+			verify: func(t *testing.T, result *RPCStats) {
+				if result.Requests != 150 {
+					t.Errorf("Requests = %d, want 150", result.Requests)
+				}
+				if result.IncomingBytes != 1500 {
+					t.Errorf("IncomingBytes = %d, want 1500", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 3000 {
+					t.Errorf("OutgoingBytes = %d, want 3000", result.OutgoingBytes)
+				}
+				if result.RequestTimeSecs != 7.5 {
+					t.Errorf("RequestTimeSecs = %f, want 7.5", result.RequestTimeSecs)
+				}
+				if result.WallTimeSecs != 15.0 {
+					t.Errorf("WallTimeSecs = %f, want 15.0", result.WallTimeSecs)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(*tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestConnectionStatsMerge tests ConnectionStats.Merge functionality
+func TestConnectionStatsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *ConnectionStats
+		other  *ConnectionStats
+		verify func(t *testing.T, result *ConnectionStats)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &ConnectionStats{Connected: 5},
+			other: nil,
+			verify: func(t *testing.T, result *ConnectionStats) {
+				if result.Connected != 5 {
+					t.Errorf("Connected = %d, want 5", result.Connected)
+				}
+			},
+		},
+		{
+			name: "merge all fields",
+			base: &ConnectionStats{
+				Connected:        5,
+				Disconnected:     2,
+				ReconnectCount:   3,
+				OutgoingStreams:  10,
+				IncomingStreams:  8,
+				OutgoingMessages: 1000,
+				IncomingMessages: 800,
+				OutgoingBytes:    50000,
+				IncomingBytes:    40000,
+				OutQueue:         15,
+				LastPongTime:     now,
+				LastConnectTime:  now,
+				LastPingMS:       5.5,
+				MaxPingDurMS:     10.0,
+			},
+			other: &ConnectionStats{
+				Connected:        3,
+				Disconnected:     1,
+				ReconnectCount:   2,
+				OutgoingStreams:  5,
+				IncomingStreams:  4,
+				OutgoingMessages: 500,
+				IncomingMessages: 400,
+				OutgoingBytes:    25000,
+				IncomingBytes:    20000,
+				OutQueue:         10,
+				LastPongTime:     later,
+				LastConnectTime:  later,
+				LastPingMS:       8.0,
+				MaxPingDurMS:     7.0,
+			},
+			verify: func(t *testing.T, result *ConnectionStats) {
+				if result.Connected != 8 {
+					t.Errorf("Connected = %d, want 8", result.Connected)
+				}
+				if result.Disconnected != 3 {
+					t.Errorf("Disconnected = %d, want 3", result.Disconnected)
+				}
+				if result.ReconnectCount != 5 {
+					t.Errorf("ReconnectCount = %d, want 5", result.ReconnectCount)
+				}
+				if result.OutgoingStreams != 15 {
+					t.Errorf("OutgoingStreams = %d, want 15", result.OutgoingStreams)
+				}
+				if result.IncomingStreams != 12 {
+					t.Errorf("IncomingStreams = %d, want 12", result.IncomingStreams)
+				}
+				if result.OutgoingMessages != 1500 {
+					t.Errorf("OutgoingMessages = %d, want 1500", result.OutgoingMessages)
+				}
+				if result.IncomingMessages != 1200 {
+					t.Errorf("IncomingMessages = %d, want 1200", result.IncomingMessages)
+				}
+				if result.OutgoingBytes != 75000 {
+					t.Errorf("OutgoingBytes = %d, want 75000", result.OutgoingBytes)
+				}
+				if result.IncomingBytes != 60000 {
+					t.Errorf("IncomingBytes = %d, want 60000", result.IncomingBytes)
+				}
+				if result.OutQueue != 25 {
+					t.Errorf("OutQueue = %d, want 25", result.OutQueue)
+				}
+				// Latest timestamps should win
+				if !result.LastPongTime.Equal(later) {
+					t.Errorf("LastPongTime = %v, want %v", result.LastPongTime, later)
+				}
+				if !result.LastConnectTime.Equal(later) {
+					t.Errorf("LastConnectTime = %v, want %v", result.LastConnectTime, later)
+				}
+				// LastPingMS should come from the source with the later LastPongTime
+				if result.LastPingMS != 8.0 {
+					t.Errorf("LastPingMS = %f, want 8.0", result.LastPingMS)
+				}
+				// MaxPingDurMS should be the maximum
+				if result.MaxPingDurMS != 10.0 {
+					t.Errorf("MaxPingDurMS = %f, want 10.0", result.MaxPingDurMS)
+				}
+			},
+		},
+		{
+			name: "merge with older times - keep existing",
+			base: &ConnectionStats{
+				LastPongTime:    later,
+				LastConnectTime: later,
+				LastPingMS:      5.0,
+				MaxPingDurMS:    8.0,
+			},
+			other: &ConnectionStats{
+				LastPongTime:    now,
+				LastConnectTime: now,
+				LastPingMS:      7.0,
+				MaxPingDurMS:    6.0,
+			},
+			verify: func(t *testing.T, result *ConnectionStats) {
+				if !result.LastPongTime.Equal(later) {
+					t.Errorf("LastPongTime = %v, want %v", result.LastPongTime, later)
+				}
+				if !result.LastConnectTime.Equal(later) {
+					t.Errorf("LastConnectTime = %v, want %v", result.LastConnectTime, later)
+				}
+				if result.LastPingMS != 5.0 {
+					t.Errorf("LastPingMS = %f, want 5.0", result.LastPingMS)
+				}
+				if result.MaxPingDurMS != 8.0 {
+					t.Errorf("MaxPingDurMS = %f, want 8.0", result.MaxPingDurMS)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestRPCMetricsMerge tests RPCMetrics.Merge functionality with embedded ConnectionStats
+func TestRPCMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *RPCMetrics
+		other  *RPCMetrics
+		verify func(t *testing.T, result *RPCMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &RPCMetrics{Nodes: 3},
+			other: nil,
+			verify: func(t *testing.T, result *RPCMetrics) {
+				if result.Nodes != 3 {
+					t.Errorf("Nodes = %d, want 3", result.Nodes)
+				}
+			},
+		},
+		{
+			name: "merge basic fields and embedded ConnectionStats",
+			base: &RPCMetrics{
+				Nodes:       2,
+				CollectedAt: now,
+				ConnectionStats: ConnectionStats{
+					Connected:        5,
+					Disconnected:     1,
+					ReconnectCount:   2,
+					OutgoingStreams:  10,
+					IncomingStreams:  8,
+					OutgoingMessages: 1000,
+					IncomingMessages: 800,
+					OutgoingBytes:    50000,
+					IncomingBytes:    40000,
+					OutQueue:         15,
+					LastPongTime:     now,
+					LastConnectTime:  now,
+					LastPingMS:       5.5,
+					MaxPingDurMS:     10.0,
+				},
+			},
+			other: &RPCMetrics{
+				Nodes:       3,
+				CollectedAt: later,
+				ConnectionStats: ConnectionStats{
+					Connected:        3,
+					Disconnected:     2,
+					ReconnectCount:   1,
+					OutgoingStreams:  5,
+					IncomingStreams:  4,
+					OutgoingMessages: 500,
+					IncomingMessages: 400,
+					OutgoingBytes:    25000,
+					IncomingBytes:    20000,
+					OutQueue:         10,
+					LastPongTime:     later,
+					LastConnectTime:  later,
+					LastPingMS:       8.0,
+					MaxPingDurMS:     7.0,
+				},
+			},
+			verify: func(t *testing.T, result *RPCMetrics) {
+				// Check Nodes
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				// Check CollectedAt
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				// Check embedded ConnectionStats fields
+				if result.Connected != 8 {
+					t.Errorf("Connected = %d, want 8", result.Connected)
+				}
+				if result.Disconnected != 3 {
+					t.Errorf("Disconnected = %d, want 3", result.Disconnected)
+				}
+				if result.ReconnectCount != 3 {
+					t.Errorf("ReconnectCount = %d, want 3", result.ReconnectCount)
+				}
+				if result.OutgoingStreams != 15 {
+					t.Errorf("OutgoingStreams = %d, want 15", result.OutgoingStreams)
+				}
+				if result.IncomingStreams != 12 {
+					t.Errorf("IncomingStreams = %d, want 12", result.IncomingStreams)
+				}
+				if result.OutgoingMessages != 1500 {
+					t.Errorf("OutgoingMessages = %d, want 1500", result.OutgoingMessages)
+				}
+				if result.IncomingMessages != 1200 {
+					t.Errorf("IncomingMessages = %d, want 1200", result.IncomingMessages)
+				}
+				if result.OutgoingBytes != 75000 {
+					t.Errorf("OutgoingBytes = %d, want 75000", result.OutgoingBytes)
+				}
+				if result.IncomingBytes != 60000 {
+					t.Errorf("IncomingBytes = %d, want 60000", result.IncomingBytes)
+				}
+				if result.OutQueue != 25 {
+					t.Errorf("OutQueue = %d, want 25", result.OutQueue)
+				}
+				if !result.LastPongTime.Equal(later) {
+					t.Errorf("LastPongTime = %v, want %v", result.LastPongTime, later)
+				}
+				if !result.LastConnectTime.Equal(later) {
+					t.Errorf("LastConnectTime = %v, want %v", result.LastConnectTime, later)
+				}
+				if result.LastPingMS != 8.0 {
+					t.Errorf("LastPingMS = %f, want 8.0", result.LastPingMS)
+				}
+				if result.MaxPingDurMS != 10.0 {
+					t.Errorf("MaxPingDurMS = %f, want 10.0", result.MaxPingDurMS)
+				}
+			},
+		},
+		{
+			name: "merge LastMinute map",
+			base: &RPCMetrics{
+				Nodes: 1,
+				LastMinute: map[string]RPCStats{
+					"handler1": {Requests: 100, IncomingBytes: 1000},
+					"handler2": {Requests: 50, IncomingBytes: 500},
+				},
+			},
+			other: &RPCMetrics{
+				Nodes: 1,
+				LastMinute: map[string]RPCStats{
+					"handler1": {Requests: 200, IncomingBytes: 2000},
+					"handler3": {Requests: 75, IncomingBytes: 750},
+				},
+			},
+			verify: func(t *testing.T, result *RPCMetrics) {
+				if len(result.LastMinute) != 3 {
+					t.Errorf("LastMinute length = %d, want 3", len(result.LastMinute))
+				}
+				// handler1 should be merged
+				if result.LastMinute["handler1"].Requests != 300 {
+					t.Errorf("LastMinute[handler1].Requests = %d, want 300", result.LastMinute["handler1"].Requests)
+				}
+				if result.LastMinute["handler1"].IncomingBytes != 3000 {
+					t.Errorf("LastMinute[handler1].IncomingBytes = %d, want 3000", result.LastMinute["handler1"].IncomingBytes)
+				}
+				// handler2 should remain unchanged
+				if result.LastMinute["handler2"].Requests != 50 {
+					t.Errorf("LastMinute[handler2].Requests = %d, want 50", result.LastMinute["handler2"].Requests)
+				}
+				// handler3 should be added
+				if result.LastMinute["handler3"].Requests != 75 {
+					t.Errorf("LastMinute[handler3].Requests = %d, want 75", result.LastMinute["handler3"].Requests)
+				}
+			},
+		},
+		{
+			name: "merge LastDay map with SegmentedRPCMetrics",
+			base: &RPCMetrics{
+				Nodes: 1,
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments:  []RPCStats{{Requests: 100}},
+					},
+				},
+			},
+			other: &RPCMetrics{
+				Nodes: 1,
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments:  []RPCStats{{Requests: 200}},
+					},
+					"handler2": {
+						Interval:  60,
+						FirstTime: now,
+						Segments:  []RPCStats{{Requests: 150}},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *RPCMetrics) {
+				if len(result.LastDay) != 2 {
+					t.Errorf("LastDay length = %d, want 2", len(result.LastDay))
+				}
+				// handler1 should be merged (same interval and start time, so segments are merged in place)
+				if len(result.LastDay["handler1"].Segments) != 1 {
+					t.Errorf("LastDay[handler1].Segments length = %d, want 1", len(result.LastDay["handler1"].Segments))
+				}
+				if result.LastDay["handler1"].Segments[0].Requests != 300 {
+					t.Errorf("LastDay[handler1].Segments[0].Requests = %d, want 300", result.LastDay["handler1"].Segments[0].Requests)
+				}
+				// handler2 should be added
+				if len(result.LastDay["handler2"].Segments) != 1 {
+					t.Errorf("LastDay[handler2].Segments length = %d, want 1", len(result.LastDay["handler2"].Segments))
+				}
+				if result.LastDay["handler2"].Segments[0].Requests != 150 {
+					t.Errorf("LastDay[handler2].Segments[0].Requests = %d, want 150", result.LastDay["handler2"].Segments[0].Requests)
+				}
+			},
+		},
+		{
+			name: "merge ByDestination map with ConnectionStats",
+			base: &RPCMetrics{
+				Nodes: 1,
+				ByDestination: map[string]ConnectionStats{
+					"server1": {
+						Connected:        3,
+						OutgoingMessages: 500,
+						IncomingMessages: 400,
+						MaxPingDurMS:     5.0,
+					},
+					"server2": {
+						Connected:        2,
+						OutgoingMessages: 300,
+						IncomingMessages: 250,
+						MaxPingDurMS:     3.0,
+					},
+				},
+			},
+			other: &RPCMetrics{
+				Nodes: 1,
+				ByDestination: map[string]ConnectionStats{
+					"server1": {
+						Connected:        2,
+						OutgoingMessages: 300,
+						IncomingMessages: 250,
+						MaxPingDurMS:     7.0,
+					},
+					"server3": {
+						Connected:        1,
+						OutgoingMessages: 100,
+						IncomingMessages: 80,
+						MaxPingDurMS:     2.0,
+					},
+				},
+			},
+			verify: func(t *testing.T, result *RPCMetrics) {
+				if len(result.ByDestination) != 3 {
+					t.Errorf("ByDestination length = %d, want 3", len(result.ByDestination))
+				}
+				// server1 should be merged
+				if result.ByDestination["server1"].Connected != 5 {
+					t.Errorf("ByDestination[server1].Connected = %d, want 5", result.ByDestination["server1"].Connected)
+				}
+				if result.ByDestination["server1"].OutgoingMessages != 800 {
+					t.Errorf("ByDestination[server1].OutgoingMessages = %d, want 800", result.ByDestination["server1"].OutgoingMessages)
+				}
+				if result.ByDestination["server1"].MaxPingDurMS != 7.0 {
+					t.Errorf("ByDestination[server1].MaxPingDurMS = %f, want 7.0", result.ByDestination["server1"].MaxPingDurMS)
+				}
+				// server2 should remain unchanged
+				if result.ByDestination["server2"].Connected != 2 {
+					t.Errorf("ByDestination[server2].Connected = %d, want 2", result.ByDestination["server2"].Connected)
+				}
+				// server3 should be added
+				if result.ByDestination["server3"].Connected != 1 {
+					t.Errorf("ByDestination[server3].Connected = %d, want 1", result.ByDestination["server3"].Connected)
+				}
+			},
+		},
+		{
+			name: "merge ByCaller map with ConnectionStats",
+			base: &RPCMetrics{
+				Nodes: 1,
+				ByCaller: map[string]ConnectionStats{
+					"client1": {
+						Connected:        2,
+						IncomingMessages: 300,
+						OutgoingMessages: 250,
+						LastPingMS:       4.0,
+					},
+				},
+			},
+			other: &RPCMetrics{
+				Nodes: 1,
+				ByCaller: map[string]ConnectionStats{
+					"client1": {
+						Connected:        3,
+						IncomingMessages: 400,
+						OutgoingMessages: 350,
+						LastPingMS:       6.0,
+					},
+					"client2": {
+						Connected:        1,
+						IncomingMessages: 100,
+						OutgoingMessages: 80,
+						LastPingMS:       2.0,
+					},
+				},
+			},
+			verify: func(t *testing.T, result *RPCMetrics) {
+				if len(result.ByCaller) != 2 {
+					t.Errorf("ByCaller length = %d, want 2", len(result.ByCaller))
+				}
+				// client1 should be merged
+				if result.ByCaller["client1"].Connected != 5 {
+					t.Errorf("ByCaller[client1].Connected = %d, want 5", result.ByCaller["client1"].Connected)
+				}
+				if result.ByCaller["client1"].IncomingMessages != 700 {
+					t.Errorf("ByCaller[client1].IncomingMessages = %d, want 700", result.ByCaller["client1"].IncomingMessages)
+				}
+				// client2 should be added
+				if result.ByCaller["client2"].Connected != 1 {
+					t.Errorf("ByCaller[client2].Connected = %d, want 1", result.ByCaller["client2"].Connected)
+				}
+			},
+		},
+		{
+			name: "merge all fields together",
+			base: &RPCMetrics{
+				Nodes:       2,
+				CollectedAt: now,
+				ConnectionStats: ConnectionStats{
+					Connected:        5,
+					OutgoingMessages: 1000,
+					MaxPingDurMS:     10.0,
+				},
+				LastMinute: map[string]RPCStats{
+					"handler1": {Requests: 100},
+				},
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {Segments: []RPCStats{{Requests: 1000}}},
+				},
+				ByDestination: map[string]ConnectionStats{
+					"server1": {Connected: 3},
+				},
+				ByCaller: map[string]ConnectionStats{
+					"client1": {Connected: 2},
+				},
+			},
+			other: &RPCMetrics{
+				Nodes:       3,
+				CollectedAt: later,
+				ConnectionStats: ConnectionStats{
+					Connected:        3,
+					OutgoingMessages: 500,
+					MaxPingDurMS:     7.0,
+				},
+				LastMinute: map[string]RPCStats{
+					"handler2": {Requests: 50},
+				},
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler2": {Segments: []RPCStats{{Requests: 500}}},
+				},
+				ByDestination: map[string]ConnectionStats{
+					"server2": {Connected: 1},
+				},
+				ByCaller: map[string]ConnectionStats{
+					"client2": {Connected: 1},
+				},
+			},
+			verify: func(t *testing.T, result *RPCMetrics) {
+				// Check basic fields
+				if result.Nodes != 5 {
+					t.Errorf("Nodes = %d, want 5", result.Nodes)
+				}
+				if !result.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", result.CollectedAt, later)
+				}
+				// Check ConnectionStats
+				if result.Connected != 8 {
+					t.Errorf("Connected = %d, want 8", result.Connected)
+				}
+				if result.OutgoingMessages != 1500 {
+					t.Errorf("OutgoingMessages = %d, want 1500", result.OutgoingMessages)
+				}
+				if result.MaxPingDurMS != 10.0 {
+					t.Errorf("MaxPingDurMS = %f, want 10.0", result.MaxPingDurMS)
+				}
+				// Check maps
+				if len(result.LastMinute) != 2 {
+					t.Errorf("LastMinute length = %d, want 2", len(result.LastMinute))
+				}
+				if len(result.LastDay) != 2 {
+					t.Errorf("LastDay length = %d, want 2", len(result.LastDay))
+				}
+				if len(result.ByDestination) != 2 {
+					t.Errorf("ByDestination length = %d, want 2", len(result.ByDestination))
+				}
+				if len(result.ByCaller) != 2 {
+					t.Errorf("ByCaller length = %d, want 2", len(result.ByCaller))
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestRPCMetricsLastMinuteTotal tests RPCMetrics.LastMinuteTotal functionality
+func TestRPCMetricsLastMinuteTotal(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name   string
+		input  *RPCMetrics
+		verify func(t *testing.T, result RPCStats)
+	}{
+		{
+			name: "empty LastMinute map",
+			input: &RPCMetrics{
+				LastMinute: map[string]RPCStats{},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 0 {
+					t.Errorf("Requests = %d, want 0", result.Requests)
+				}
+				if result.IncomingBytes != 0 {
+					t.Errorf("IncomingBytes = %d, want 0", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 0 {
+					t.Errorf("OutgoingBytes = %d, want 0", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "nil LastMinute map",
+			input: &RPCMetrics{
+				LastMinute: nil,
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 0 {
+					t.Errorf("Requests = %d, want 0", result.Requests)
+				}
+				if result.IncomingBytes != 0 {
+					t.Errorf("IncomingBytes = %d, want 0", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 0 {
+					t.Errorf("OutgoingBytes = %d, want 0", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "single handler stats",
+			input: &RPCMetrics{
+				LastMinute: map[string]RPCStats{
+					"handler1": {
+						StartTime:       &now,
+						EndTime:         &now,
+						WallTimeSecs:    10.0,
+						Requests:        100,
+						RequestTimeSecs: 5.0,
+						IncomingBytes:   1000,
+						OutgoingBytes:   2000,
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 100 {
+					t.Errorf("Requests = %d, want 100", result.Requests)
+				}
+				if result.RequestTimeSecs != 5.0 {
+					t.Errorf("RequestTimeSecs = %f, want 5.0", result.RequestTimeSecs)
+				}
+				if result.IncomingBytes != 1000 {
+					t.Errorf("IncomingBytes = %d, want 1000", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 2000 {
+					t.Errorf("OutgoingBytes = %d, want 2000", result.OutgoingBytes)
+				}
+				if result.WallTimeSecs != 10.0 {
+					t.Errorf("WallTimeSecs = %f, want 10.0", result.WallTimeSecs)
+				}
+			},
+		},
+		{
+			name: "multiple handler stats",
+			input: &RPCMetrics{
+				LastMinute: map[string]RPCStats{
+					"handler1": {
+						StartTime:       &now,
+						EndTime:         &now,
+						WallTimeSecs:    10.0,
+						Requests:        100,
+						RequestTimeSecs: 5.0,
+						IncomingBytes:   1000,
+						OutgoingBytes:   2000,
+					},
+					"handler2": {
+						StartTime:       &now,
+						EndTime:         &now,
+						WallTimeSecs:    15.0,
+						Requests:        200,
+						RequestTimeSecs: 10.0,
+						IncomingBytes:   1500,
+						OutgoingBytes:   2500,
+					},
+					"handler3": {
+						StartTime:       &now,
+						EndTime:         &now,
+						WallTimeSecs:    5.0,
+						Requests:        50,
+						RequestTimeSecs: 2.5,
+						IncomingBytes:   500,
+						OutgoingBytes:   1000,
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 350 { // 100 + 200 + 50
+					t.Errorf("Requests = %d, want 350", result.Requests)
+				}
+				if result.RequestTimeSecs != 17.5 { // 5.0 + 10.0 + 2.5
+					t.Errorf("RequestTimeSecs = %f, want 17.5", result.RequestTimeSecs)
+				}
+				if result.IncomingBytes != 3000 { // 1000 + 1500 + 500
+					t.Errorf("IncomingBytes = %d, want 3000", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 5500 { // 2000 + 2500 + 1000
+					t.Errorf("OutgoingBytes = %d, want 5500", result.OutgoingBytes)
+				}
+				if result.WallTimeSecs != 30.0 { // 10.0 + 15.0 + 5.0
+					t.Errorf("WallTimeSecs = %f, want 30.0", result.WallTimeSecs)
+				}
+			},
+		},
+		{
+			name: "different timestamps should nullify in merge",
+			input: &RPCMetrics{
+				LastMinute: map[string]RPCStats{
+					"handler1": {
+						StartTime:     &now,
+						EndTime:       &now,
+						Requests:      100,
+						IncomingBytes: 1000,
+						OutgoingBytes: 2000,
+					},
+					"handler2": {
+						StartTime:     func() *time.Time { t := now.Add(time.Minute); return &t }(),
+						EndTime:       func() *time.Time { t := now.Add(time.Minute); return &t }(),
+						Requests:      200,
+						IncomingBytes: 1500,
+						OutgoingBytes: 2500,
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				// When merging different timestamps, they should be nullified
+				if result.StartTime != nil {
+					t.Error("StartTime should be nil when merging different timestamps")
+				}
+				if result.EndTime != nil {
+					t.Error("EndTime should be nil when merging different timestamps")
+				}
+				if result.Requests != 300 {
+					t.Errorf("Requests = %d, want 300", result.Requests)
+				}
+				if result.IncomingBytes != 2500 {
+					t.Errorf("IncomingBytes = %d, want 2500", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 4500 {
+					t.Errorf("OutgoingBytes = %d, want 4500", result.OutgoingBytes)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.input.LastMinuteTotal()
+			tt.verify(t, result)
+		})
+	}
+}
+
+// TestRPCMetricsLastDayTotalSegmented tests RPCMetrics.LastDayTotalSegmented functionality
+func TestRPCMetricsLastDayTotalSegmented(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name   string
+		input  *RPCMetrics
+		verify func(t *testing.T, result SegmentedRPCMetrics)
+	}{
+		{
+			name: "empty LastDay map",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{},
+			},
+			verify: func(t *testing.T, result SegmentedRPCMetrics) {
+				if len(result.Segments) != 0 {
+					t.Errorf("Segments length = %d, want 0", len(result.Segments))
+				}
+			},
+		},
+		{
+			name: "nil LastDay map",
+			input: &RPCMetrics{
+				LastDay: nil,
+			},
+			verify: func(t *testing.T, result SegmentedRPCMetrics) {
+				if len(result.Segments) != 0 {
+					t.Errorf("Segments length = %d, want 0", len(result.Segments))
+				}
+			},
+		},
+		{
+			name: "single handler with segments",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 100, IncomingBytes: 1000, OutgoingBytes: 2000},
+							{Requests: 200, IncomingBytes: 1500, OutgoingBytes: 2500},
+							{Requests: 150, IncomingBytes: 1200, OutgoingBytes: 2200},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result SegmentedRPCMetrics) {
+				if result.Interval != 60 {
+					t.Errorf("Interval = %d, want 60", result.Interval)
+				}
+				if !result.FirstTime.Equal(now) {
+					t.Errorf("FirstTime = %v, want %v", result.FirstTime, now)
+				}
+				if len(result.Segments) != 3 {
+					t.Errorf("Segments length = %d, want 3", len(result.Segments))
+				}
+				// Check individual segments
+				if result.Segments[0].Requests != 100 {
+					t.Errorf("Segments[0].Requests = %d, want 100", result.Segments[0].Requests)
+				}
+				if result.Segments[1].Requests != 200 {
+					t.Errorf("Segments[1].Requests = %d, want 200", result.Segments[1].Requests)
+				}
+				if result.Segments[2].Requests != 150 {
+					t.Errorf("Segments[2].Requests = %d, want 150", result.Segments[2].Requests)
+				}
+			},
+		},
+		{
+			name: "multiple handlers with same interval and time - should merge",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 100, IncomingBytes: 1000},
+							{Requests: 200, IncomingBytes: 1500},
+						},
+					},
+					"handler2": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 50, IncomingBytes: 500},
+							{Requests: 75, IncomingBytes: 750},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result SegmentedRPCMetrics) {
+				if result.Interval != 60 {
+					t.Errorf("Interval = %d, want 60", result.Interval)
+				}
+				if !result.FirstTime.Equal(now) {
+					t.Errorf("FirstTime = %v, want %v", result.FirstTime, now)
+				}
+				if len(result.Segments) != 2 {
+					t.Errorf("Segments length = %d, want 2", len(result.Segments))
+				}
+				// Check merged segments
+				if result.Segments[0].Requests != 150 { // 100 + 50
+					t.Errorf("Segments[0].Requests = %d, want 150", result.Segments[0].Requests)
+				}
+				if result.Segments[0].IncomingBytes != 1500 { // 1000 + 500
+					t.Errorf("Segments[0].IncomingBytes = %d, want 1500", result.Segments[0].IncomingBytes)
+				}
+				if result.Segments[1].Requests != 275 { // 200 + 75
+					t.Errorf("Segments[1].Requests = %d, want 275", result.Segments[1].Requests)
+				}
+				if result.Segments[1].IncomingBytes != 2250 { // 1500 + 750
+					t.Errorf("Segments[1].IncomingBytes = %d, want 2250", result.Segments[1].IncomingBytes)
+				}
+			},
+		},
+		{
+			name: "multiple handlers with different intervals - should not merge",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 100},
+							{Requests: 200},
+						},
+					},
+					"handler2": {
+						Interval:  120, // Different interval
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 50},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result SegmentedRPCMetrics) {
+				// When intervals differ, only one handler's data is kept (whichever is processed first in map iteration)
+				// Due to Go's non-deterministic map iteration, we accept either handler's data
+				if result.Interval != 60 && result.Interval != 120 {
+					t.Errorf("Interval = %d, want 60 or 120", result.Interval)
+				}
+
+				if result.Interval == 60 {
+					// handler1 was processed first
+					if len(result.Segments) != 2 {
+						t.Errorf("Segments length = %d, want 2", len(result.Segments))
+					}
+					if len(result.Segments) >= 1 && result.Segments[0].Requests != 100 {
+						t.Errorf("Segments[0].Requests = %d, want 100", result.Segments[0].Requests)
+					}
+					if len(result.Segments) >= 2 && result.Segments[1].Requests != 200 {
+						t.Errorf("Segments[1].Requests = %d, want 200", result.Segments[1].Requests)
+					}
+				} else {
+					// handler2 was processed first
+					if len(result.Segments) != 1 {
+						t.Errorf("Segments length = %d, want 1", len(result.Segments))
+					}
+					if len(result.Segments) >= 1 && result.Segments[0].Requests != 50 {
+						t.Errorf("Segments[0].Requests = %d, want 50", result.Segments[0].Requests)
+					}
+				}
+			},
+		},
+		{
+			name: "multiple handlers with different first times - should create timeline",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 100},
+						},
+					},
+					"handler2": {
+						Interval:  60,
+						FirstTime: now.Add(time.Hour), // 1 hour later = 60 segments later
+						Segments: []RPCStats{
+							{Requests: 50},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result SegmentedRPCMetrics) {
+				if result.Interval != 60 {
+					t.Errorf("Interval = %d, want 60", result.Interval)
+				}
+				// Should create a timeline from earliest to latest (61 segments total)
+				if len(result.Segments) != 61 { // 60 minute gap + 1 segment on each end
+					t.Errorf("Segments length = %d, want 61", len(result.Segments))
+				}
+				// First segment should have handler1's data
+				if result.Segments[0].Requests != 100 {
+					t.Errorf("Segments[0].Requests = %d, want 100", result.Segments[0].Requests)
+				}
+				// Last segment should have handler2's data
+				if result.Segments[60].Requests != 50 {
+					t.Errorf("Segments[60].Requests = %d, want 50", result.Segments[60].Requests)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.input.LastDayTotalSegmented()
+			tt.verify(t, result)
+		})
+	}
+}
+
+// TestRPCMetricsLastDayTotal tests RPCMetrics.LastDayTotal functionality
+func TestRPCMetricsLastDayTotal(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name   string
+		input  *RPCMetrics
+		verify func(t *testing.T, result RPCStats)
+	}{
+		{
+			name: "empty LastDay map",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 0 {
+					t.Errorf("Requests = %d, want 0", result.Requests)
+				}
+				if result.IncomingBytes != 0 {
+					t.Errorf("IncomingBytes = %d, want 0", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 0 {
+					t.Errorf("OutgoingBytes = %d, want 0", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "nil LastDay map",
+			input: &RPCMetrics{
+				LastDay: nil,
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 0 {
+					t.Errorf("Requests = %d, want 0", result.Requests)
+				}
+				if result.IncomingBytes != 0 {
+					t.Errorf("IncomingBytes = %d, want 0", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 0 {
+					t.Errorf("OutgoingBytes = %d, want 0", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "single handler with single segment",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{
+								StartTime:       &now,
+								EndTime:         &now,
+								WallTimeSecs:    10.0,
+								Requests:        100,
+								RequestTimeSecs: 5.0,
+								IncomingBytes:   1000,
+								OutgoingBytes:   2000,
+							},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 100 {
+					t.Errorf("Requests = %d, want 100", result.Requests)
+				}
+				if result.RequestTimeSecs != 5.0 {
+					t.Errorf("RequestTimeSecs = %f, want 5.0", result.RequestTimeSecs)
+				}
+				if result.IncomingBytes != 1000 {
+					t.Errorf("IncomingBytes = %d, want 1000", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 2000 {
+					t.Errorf("OutgoingBytes = %d, want 2000", result.OutgoingBytes)
+				}
+				if result.WallTimeSecs != 10.0 {
+					t.Errorf("WallTimeSecs = %f, want 10.0", result.WallTimeSecs)
+				}
+			},
+		},
+		{
+			name: "single handler with multiple segments",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{
+								StartTime:       &now,
+								EndTime:         &now,
+								WallTimeSecs:    10.0,
+								Requests:        100,
+								RequestTimeSecs: 5.0,
+								IncomingBytes:   1000,
+								OutgoingBytes:   2000,
+							},
+							{
+								StartTime:       &now,
+								EndTime:         &now,
+								WallTimeSecs:    15.0,
+								Requests:        200,
+								RequestTimeSecs: 10.0,
+								IncomingBytes:   1500,
+								OutgoingBytes:   2500,
+							},
+							{
+								StartTime:       &now,
+								EndTime:         &now,
+								WallTimeSecs:    5.0,
+								Requests:        50,
+								RequestTimeSecs: 2.5,
+								IncomingBytes:   500,
+								OutgoingBytes:   1000,
+							},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				if result.Requests != 350 { // 100 + 200 + 50
+					t.Errorf("Requests = %d, want 350", result.Requests)
+				}
+				if result.RequestTimeSecs != 17.5 { // 5.0 + 10.0 + 2.5
+					t.Errorf("RequestTimeSecs = %f, want 17.5", result.RequestTimeSecs)
+				}
+				if result.IncomingBytes != 3000 { // 1000 + 1500 + 500
+					t.Errorf("IncomingBytes = %d, want 3000", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 5500 { // 2000 + 2500 + 1000
+					t.Errorf("OutgoingBytes = %d, want 5500", result.OutgoingBytes)
+				}
+				if result.WallTimeSecs != 30.0 { // 10.0 + 15.0 + 5.0
+					t.Errorf("WallTimeSecs = %f, want 30.0", result.WallTimeSecs)
+				}
+			},
+		},
+		{
+			name: "multiple handlers with segments",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 100, IncomingBytes: 1000, OutgoingBytes: 2000},
+							{Requests: 200, IncomingBytes: 1500, OutgoingBytes: 2500},
+						},
+					},
+					"handler2": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 50, IncomingBytes: 500, OutgoingBytes: 1000},
+							{Requests: 75, IncomingBytes: 750, OutgoingBytes: 1250},
+						},
+					},
+					"handler3": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 25, IncomingBytes: 250, OutgoingBytes: 500},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				// Total across all handlers and all segments
+				if result.Requests != 450 { // 100+200+50+75+25
+					t.Errorf("Requests = %d, want 450", result.Requests)
+				}
+				if result.IncomingBytes != 4000 { // 1000+1500+500+750+250
+					t.Errorf("IncomingBytes = %d, want 4000", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 7250 { // 2000+2500+1000+1250+500
+					t.Errorf("OutgoingBytes = %d, want 7250", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "handlers with empty segments",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments:  []RPCStats{}, // Empty segments
+					},
+					"handler2": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{Requests: 100, IncomingBytes: 1000, OutgoingBytes: 2000},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				// Only handler2's data should be counted
+				if result.Requests != 100 {
+					t.Errorf("Requests = %d, want 100", result.Requests)
+				}
+				if result.IncomingBytes != 1000 {
+					t.Errorf("IncomingBytes = %d, want 1000", result.IncomingBytes)
+				}
+				if result.OutgoingBytes != 2000 {
+					t.Errorf("OutgoingBytes = %d, want 2000", result.OutgoingBytes)
+				}
+			},
+		},
+		{
+			name: "merging with different timestamps across segments",
+			input: &RPCMetrics{
+				LastDay: map[string]SegmentedRPCMetrics{
+					"handler1": {
+						Interval:  60,
+						FirstTime: now,
+						Segments: []RPCStats{
+							{
+								StartTime:     &now,
+								EndTime:       &now,
+								Requests:      100,
+								IncomingBytes: 1000,
+							},
+							{
+								StartTime:     nil, // Different timestamps
+								EndTime:       nil,
+								Requests:      200,
+								IncomingBytes: 2000,
+							},
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result RPCStats) {
+				// When first segment has timestamps and requests, they stay
+				// But when merging with nil timestamps, they should stay as is
+				// because the first merge copies the timestamp
+				if result.StartTime == nil || !result.StartTime.Equal(now) {
+					t.Error("StartTime should be preserved from first segment")
+				}
+				if result.EndTime == nil || !result.EndTime.Equal(now) {
+					t.Error("EndTime should be preserved from first segment")
+				}
+				if result.Requests != 300 {
+					t.Errorf("Requests = %d, want 300", result.Requests)
+				}
+				if result.IncomingBytes != 3000 {
+					t.Errorf("IncomingBytes = %d, want 3000", result.IncomingBytes)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.input.LastDayTotal()
+			tt.verify(t, result)
+		})
+	}
+}
+
+// TestNetMetricsMerge tests NetMetrics.Merge functionality with Interfaces field
+func TestNetMetricsMerge(t *testing.T) {
+	now := time.Now()
+	earlier := now.Add(-time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *NetMetrics
+		other  *NetMetrics
+		verify func(t *testing.T, result *NetMetrics)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &NetMetrics{CollectedAt: now},
+			other: nil,
+			verify: func(t *testing.T, result *NetMetrics) {
+				if !result.CollectedAt.Equal(now) {
+					t.Error("CollectedAt should not change when merging nil")
+				}
+			},
+		},
+		{
+			name: "merge timestamps - use latest",
+			base: &NetMetrics{
+				CollectedAt: earlier,
+			},
+			other: &NetMetrics{
+				CollectedAt: now,
+			},
+			verify: func(t *testing.T, result *NetMetrics) {
+				if !result.CollectedAt.Equal(now) {
+					t.Error("CollectedAt should use the latest timestamp")
+				}
+			},
+		},
+		{
+			name: "merge NetStats",
+			base: &NetMetrics{
+				CollectedAt: now,
+				NetStats: procfs.NetDevLine{
+					RxBytes:   1000,
+					TxBytes:   2000,
+					RxPackets: 100,
+					TxPackets: 200,
+				},
+			},
+			other: &NetMetrics{
+				CollectedAt: earlier,
+				NetStats: procfs.NetDevLine{
+					RxBytes:   500,
+					TxBytes:   1500,
+					RxPackets: 50,
+					TxPackets: 150,
+				},
+			},
+			verify: func(t *testing.T, result *NetMetrics) {
+				if result.NetStats.RxBytes != 1500 {
+					t.Errorf("NetStats.RxBytes = %d, want 1500", result.NetStats.RxBytes)
+				}
+				if result.NetStats.TxBytes != 3500 {
+					t.Errorf("NetStats.TxBytes = %d, want 3500", result.NetStats.TxBytes)
+				}
+				if result.NetStats.RxPackets != 150 {
+					t.Errorf("NetStats.RxPackets = %d, want 150", result.NetStats.RxPackets)
+				}
+				if result.NetStats.TxPackets != 350 {
+					t.Errorf("NetStats.TxPackets = %d, want 350", result.NetStats.TxPackets)
+				}
+			},
+		},
+		{
+			name: "merge Interfaces - nil base map",
+			base: &NetMetrics{
+				CollectedAt: now,
+			},
+			other: &NetMetrics{
+				CollectedAt: earlier,
+				Interfaces: map[string]InterfaceStats{
+					"eth0": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 1000,
+							TxBytes: 2000,
+						},
+					},
+					"eth1": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 3000,
+							TxBytes: 4000,
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *NetMetrics) {
+				if result.Interfaces == nil {
+					t.Fatal("Interfaces should not be nil after merge")
+				}
+				if len(result.Interfaces) != 2 {
+					t.Errorf("Interfaces length = %d, want 2", len(result.Interfaces))
+				}
+				if eth0, ok := result.Interfaces["eth0"]; !ok {
+					t.Error("Interfaces should contain eth0")
+				} else {
+					if eth0.RxBytes != 1000 {
+						t.Errorf("Interfaces[eth0].RxBytes = %d, want 1000", eth0.RxBytes)
+					}
+					if eth0.TxBytes != 2000 {
+						t.Errorf("Interfaces[eth0].TxBytes = %d, want 2000", eth0.TxBytes)
+					}
+				}
+				if eth1, ok := result.Interfaces["eth1"]; !ok {
+					t.Error("Interfaces should contain eth1")
+				} else {
+					if eth1.RxBytes != 3000 {
+						t.Errorf("Interfaces[eth1].RxBytes = %d, want 3000", eth1.RxBytes)
+					}
+					if eth1.TxBytes != 4000 {
+						t.Errorf("Interfaces[eth1].TxBytes = %d, want 4000", eth1.TxBytes)
+					}
+				}
+			},
+		},
+		{
+			name: "merge Interfaces - accumulate existing entries",
+			base: &NetMetrics{
+				CollectedAt: now,
+				Interfaces: map[string]InterfaceStats{
+					"eth0": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes:   1000,
+							TxBytes:   2000,
+							RxPackets: 100,
+							TxPackets: 200,
+						},
+					},
+					"eth1": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 5000,
+							TxBytes: 6000,
+						},
+					},
+				},
+			},
+			other: &NetMetrics{
+				CollectedAt: earlier,
+				Interfaces: map[string]InterfaceStats{
+					"eth0": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes:   500,
+							TxBytes:   1500,
+							RxPackets: 50,
+							TxPackets: 150,
+						},
+					},
+					"eth2": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 7000,
+							TxBytes: 8000,
+						},
+					},
+				},
+			},
+			verify: func(t *testing.T, result *NetMetrics) {
+				if len(result.Interfaces) != 3 {
+					t.Errorf("Interfaces length = %d, want 3", len(result.Interfaces))
+				}
+				// Check eth0 (should be accumulated)
+				if eth0, ok := result.Interfaces["eth0"]; !ok {
+					t.Error("Interfaces should contain eth0")
+				} else {
+					if eth0.RxBytes != 1500 {
+						t.Errorf("Interfaces[eth0].RxBytes = %d, want 1500", eth0.RxBytes)
+					}
+					if eth0.TxBytes != 3500 {
+						t.Errorf("Interfaces[eth0].TxBytes = %d, want 3500", eth0.TxBytes)
+					}
+					if eth0.RxPackets != 150 {
+						t.Errorf("Interfaces[eth0].RxPackets = %d, want 150", eth0.RxPackets)
+					}
+					if eth0.TxPackets != 350 {
+						t.Errorf("Interfaces[eth0].TxPackets = %d, want 350", eth0.TxPackets)
+					}
+				}
+				// Check eth1 (should remain unchanged)
+				if eth1, ok := result.Interfaces["eth1"]; !ok {
+					t.Error("Interfaces should contain eth1")
+				} else {
+					if eth1.RxBytes != 5000 {
+						t.Errorf("Interfaces[eth1].RxBytes = %d, want 5000", eth1.RxBytes)
+					}
+					if eth1.TxBytes != 6000 {
+						t.Errorf("Interfaces[eth1].TxBytes = %d, want 6000", eth1.TxBytes)
+					}
+				}
+				// Check eth2 (should be added)
+				if eth2, ok := result.Interfaces["eth2"]; !ok {
+					t.Error("Interfaces should contain eth2")
+				} else {
+					if eth2.RxBytes != 7000 {
+						t.Errorf("Interfaces[eth2].RxBytes = %d, want 7000", eth2.RxBytes)
+					}
+					if eth2.TxBytes != 8000 {
+						t.Errorf("Interfaces[eth2].TxBytes = %d, want 8000", eth2.TxBytes)
+					}
+				}
+			},
+		},
+		{
+			name: "merge all fields together",
+			base: &NetMetrics{
+				CollectedAt: earlier,
+				Interfaces: map[string]InterfaceStats{
+					"lo": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 100,
+							TxBytes: 100,
+						},
+					},
+				},
+				NetStats: procfs.NetDevLine{
+					RxBytes: 10000,
+					TxBytes: 20000,
+				},
+			},
+			other: &NetMetrics{
+				CollectedAt: now,
+				Interfaces: map[string]InterfaceStats{
+					"lo": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 200,
+							TxBytes: 200,
+						},
+					},
+					"docker0": {
+						N: 1,
+						NetDevLine: procfs.NetDevLine{
+							RxBytes: 500,
+							TxBytes: 600,
+						},
+					},
+				},
+				NetStats: procfs.NetDevLine{
+					RxBytes: 5000,
+					TxBytes: 6000,
+				},
+			},
+			verify: func(t *testing.T, result *NetMetrics) {
+				// Check timestamp
+				if !result.CollectedAt.Equal(now) {
+					t.Error("CollectedAt should use the latest timestamp")
+				}
+				// Check NetStats
+				if result.NetStats.RxBytes != 15000 {
+					t.Errorf("NetStats.RxBytes = %d, want 15000", result.NetStats.RxBytes)
+				}
+				if result.NetStats.TxBytes != 26000 {
+					t.Errorf("NetStats.TxBytes = %d, want 26000", result.NetStats.TxBytes)
+				}
+				// Check Interfaces
+				if len(result.Interfaces) != 2 {
+					t.Errorf("Interfaces length = %d, want 2", len(result.Interfaces))
+				}
+				if lo, ok := result.Interfaces["lo"]; !ok {
+					t.Error("Interfaces should contain lo")
+				} else {
+					if lo.RxBytes != 300 {
+						t.Errorf("Interfaces[lo].RxBytes = %d, want 300", lo.RxBytes)
+					}
+					if lo.TxBytes != 300 {
+						t.Errorf("Interfaces[lo].TxBytes = %d, want 300", lo.TxBytes)
+					}
+				}
+				if docker0, ok := result.Interfaces["docker0"]; !ok {
+					t.Error("Interfaces should contain docker0")
+				} else {
+					if docker0.RxBytes != 500 {
+						t.Errorf("Interfaces[docker0].RxBytes = %d, want 500", docker0.RxBytes)
+					}
+					if docker0.TxBytes != 600 {
+						t.Errorf("Interfaces[docker0].TxBytes = %d, want 600", docker0.TxBytes)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestSMARTSATAMerge tests SMARTSATA.Merge functionality
+func TestSMARTSATAMerge(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   *SMARTSATA
+		other  *SMARTSATA
+		verify func(t *testing.T, result *SMARTSATA)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &SMARTSATA{N: 1, ReallocatedSectors: 10},
+			other: nil,
+			verify: func(t *testing.T, result *SMARTSATA) {
+				if result.N != 1 {
+					t.Errorf("N = %d, want 1", result.N)
+				}
+				if result.ReallocatedSectors != 10 {
+					t.Errorf("ReallocatedSectors = %d, want 10", result.ReallocatedSectors)
+				}
+			},
+		},
+		{
+			name:  "merge into empty base",
+			base:  &SMARTSATA{},
+			other: &SMARTSATA{N: 1, ReallocatedSectors: 5, PendingSectors: 2, MaxReallocatedSectors: 5},
+			verify: func(t *testing.T, result *SMARTSATA) {
+				if result.N != 1 {
+					t.Errorf("N = %d, want 1", result.N)
+				}
+				if result.ReallocatedSectors != 5 {
+					t.Errorf("ReallocatedSectors = %d, want 5", result.ReallocatedSectors)
+				}
+				if result.MaxReallocatedSectors != 5 {
+					t.Errorf("MaxReallocatedSectors = %d, want 5", result.MaxReallocatedSectors)
+				}
+			},
+		},
+		{
+			name: "merge counts and max values",
+			base: &SMARTSATA{
+				N:                    1,
+				ReallocatedSectors:   10,
+				PendingSectors:       5,
+				OfflineUncorrectable: 2,
+				// Max values are NOT preset - they are auto-populated from raw values since N==1
+			},
+			other: &SMARTSATA{
+				N:                    1,
+				ReallocatedSectors:   15,
+				PendingSectors:       3,
+				OfflineUncorrectable: 1,
+				// Max values are NOT preset - they are auto-populated from raw values since N==1
+			},
+			verify: func(t *testing.T, result *SMARTSATA) {
+				if result.N != 2 {
+					t.Errorf("N = %d, want 2", result.N)
+				}
+				if result.ReallocatedSectors != 25 {
+					t.Errorf("ReallocatedSectors = %d, want 25", result.ReallocatedSectors)
+				}
+				if result.PendingSectors != 8 {
+					t.Errorf("PendingSectors = %d, want 8", result.PendingSectors)
+				}
+				if result.OfflineUncorrectable != 3 {
+					t.Errorf("OfflineUncorrectable = %d, want 3", result.OfflineUncorrectable)
+				}
+				// Max values should be max of raw values from both single-drive entries
+				if result.MaxReallocatedSectors != 15 {
+					t.Errorf("MaxReallocatedSectors = %d, want 15", result.MaxReallocatedSectors)
+				}
+				if result.MaxPendingSectors != 5 {
+					t.Errorf("MaxPendingSectors = %d, want 5", result.MaxPendingSectors)
+				}
+				if result.MaxOfflineUncorrectable != 2 {
+					t.Errorf("MaxOfflineUncorrectable = %d, want 2", result.MaxOfflineUncorrectable)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestSMARTNVMeMerge tests SMARTNVMe.Merge functionality
+func TestSMARTNVMeMerge(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   *SMARTNVMe
+		other  *SMARTNVMe
+		verify func(t *testing.T, result *SMARTNVMe)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &SMARTNVMe{N: 1, AvailableSpare: 90},
+			other: nil,
+			verify: func(t *testing.T, result *SMARTNVMe) {
+				if result.N != 1 {
+					t.Errorf("N = %d, want 1", result.N)
+				}
+				if result.AvailableSpare != 90 {
+					t.Errorf("AvailableSpare = %d, want 90", result.AvailableSpare)
+				}
+			},
+		},
+		{
+			name:  "merge into empty base",
+			base:  &SMARTNVMe{},
+			other: &SMARTNVMe{N: 1, AvailableSpare: 85, PercentageUsed: 15, MinAvailableSpare: 85},
+			verify: func(t *testing.T, result *SMARTNVMe) {
+				if result.N != 1 {
+					t.Errorf("N = %d, want 1", result.N)
+				}
+				if result.AvailableSpare != 85 {
+					t.Errorf("AvailableSpare = %d, want 85", result.AvailableSpare)
+				}
+				if result.MinAvailableSpare != 85 {
+					t.Errorf("MinAvailableSpare = %d, want 85", result.MinAvailableSpare)
+				}
+			},
+		},
+		{
+			name: "merge counts and min/max values",
+			base: &SMARTNVMe{
+				N:                      1,
+				CriticalWarningFlags:   0,
+				AvailableSpare:         90,
+				PercentageUsed:         10,
+				MediaErrors:            0,
+				DataUnitsRead:          1000,
+				DataUnitsWritten:       500,
+				HostReads:              2000,
+				HostWrites:             1000,
+				CtrlBusyTime:           100,
+				UnsafeShutdowns:        2,
+				WarningTempTime:        10,
+				CritCompTime:           5,
+				ThermalTransitionCount: 3,
+				ThermalManagementTime:  60,
+				// Min/Max values are NOT pre-set - they should be auto-populated from raw values since N==1
+			},
+			other: &SMARTNVMe{
+				N:                      1,
+				CriticalWarningFlags:   1,
+				AvailableSpare:         80,
+				PercentageUsed:         20,
+				MediaErrors:            5,
+				DataUnitsRead:          2000,
+				DataUnitsWritten:       1000,
+				HostReads:              3000,
+				HostWrites:             1500,
+				CtrlBusyTime:           150,
+				UnsafeShutdowns:        1,
+				WarningTempTime:        20,
+				CritCompTime:           10,
+				ThermalTransitionCount: 5,
+				ThermalManagementTime:  120,
+				// Min/Max values are NOT pre-set - they should be auto-populated from raw values since N==1
+			},
+			verify: func(t *testing.T, result *SMARTNVMe) {
+				if result.N != 2 {
+					t.Errorf("N = %d, want 2", result.N)
+				}
+				if result.CriticalWarningFlags != 1 {
+					t.Errorf("CriticalWarningFlags = %d, want 1", result.CriticalWarningFlags)
+				}
+				if result.AvailableSpare != 170 {
+					t.Errorf("AvailableSpare = %d, want 170", result.AvailableSpare)
+				}
+				if result.PercentageUsed != 30 {
+					t.Errorf("PercentageUsed = %d, want 30", result.PercentageUsed)
+				}
+				if result.MediaErrors != 5 {
+					t.Errorf("MediaErrors = %d, want 5", result.MediaErrors)
+				}
+				if result.DataUnitsRead != 3000 {
+					t.Errorf("DataUnitsRead = %f, want 3000", result.DataUnitsRead)
+				}
+				if result.DataUnitsWritten != 1500 {
+					t.Errorf("DataUnitsWritten = %f, want 1500", result.DataUnitsWritten)
+				}
+				if result.HostReads != 5000 {
+					t.Errorf("HostReads = %f, want 5000", result.HostReads)
+				}
+				if result.HostWrites != 2500 {
+					t.Errorf("HostWrites = %f, want 2500", result.HostWrites)
+				}
+				if result.CtrlBusyTime != 250 {
+					t.Errorf("CtrlBusyTime = %f, want 250", result.CtrlBusyTime)
+				}
+				if result.UnsafeShutdowns != 3 {
+					t.Errorf("UnsafeShutdowns = %d, want 3", result.UnsafeShutdowns)
+				}
+				if result.WarningTempTime != 30 {
+					t.Errorf("WarningTempTime = %f, want 30", result.WarningTempTime)
+				}
+				if result.CritCompTime != 15 {
+					t.Errorf("CritCompTime = %f, want 15", result.CritCompTime)
+				}
+				if result.ThermalTransitionCount != 8 {
+					t.Errorf("ThermalTransitionCount = %d, want 8", result.ThermalTransitionCount)
+				}
+				if result.ThermalManagementTime != 180 {
+					t.Errorf("ThermalManagementTime = %d, want 180", result.ThermalManagementTime)
+				}
+				if result.MinAvailableSpare != 80 {
+					t.Errorf("MinAvailableSpare = %d, want 80", result.MinAvailableSpare)
+				}
+				if result.MaxPercentageUsed != 20 {
+					t.Errorf("MaxPercentageUsed = %d, want 20", result.MaxPercentageUsed)
+				}
+				if result.MaxMediaErrors != 5 {
+					t.Errorf("MaxMediaErrors = %d, want 5", result.MaxMediaErrors)
+				}
+				if result.MaxDataUnitsRead != 2000 {
+					t.Errorf("MaxDataUnitsRead = %f, want 2000", result.MaxDataUnitsRead)
+				}
+				if result.MaxDataUnitsWritten != 1000 {
+					t.Errorf("MaxDataUnitsWritten = %f, want 1000", result.MaxDataUnitsWritten)
+				}
+				if result.MaxHostReads != 3000 {
+					t.Errorf("MaxHostReads = %f, want 3000", result.MaxHostReads)
+				}
+				if result.MaxHostWrites != 1500 {
+					t.Errorf("MaxHostWrites = %f, want 1500", result.MaxHostWrites)
+				}
+				if result.MaxCtrlBusyTime != 150 {
+					t.Errorf("MaxCtrlBusyTime = %f, want 150", result.MaxCtrlBusyTime)
+				}
+				if result.MaxUnsafeShutdowns != 2 {
+					t.Errorf("MaxUnsafeShutdowns = %d, want 2", result.MaxUnsafeShutdowns)
+				}
+				if result.MaxWarningTempTime != 20 {
+					t.Errorf("MaxWarningTempTime = %f, want 20", result.MaxWarningTempTime)
+				}
+				if result.MaxCritCompTime != 10 {
+					t.Errorf("MaxCritCompTime = %f, want 10", result.MaxCritCompTime)
+				}
+				if result.MaxThermalTransitionCount != 5 {
+					t.Errorf("MaxThermalTransitionCount = %d, want 5", result.MaxThermalTransitionCount)
+				}
+				if result.MaxThermalManagementTime != 120 {
+					t.Errorf("MaxThermalManagementTime = %d, want 120", result.MaxThermalManagementTime)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// TestSMARTInfoMerge tests SMARTInfo.Merge functionality
+func TestSMARTInfoMerge(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   *SMARTInfo
+		other  *SMARTInfo
+		verify func(t *testing.T, result *SMARTInfo)
+	}{
+		{
+			name:  "merge nil other",
+			base:  &SMARTInfo{N: 1, Temperature: 40.0},
+			other: nil,
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.N != 1 {
+					t.Errorf("N = %d, want 1", result.N)
+				}
+				if result.Temperature != 40.0 {
+					t.Errorf("Temperature = %f, want 40.0", result.Temperature)
+				}
+			},
+		},
+		{
+			name:  "merge into empty base",
+			base:  &SMARTInfo{},
+			other: &SMARTInfo{N: 1, Temperature: 45.0, StatsN: 1, MaxTemperature: 45.0},
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.N != 1 {
+					t.Errorf("N = %d, want 1", result.N)
+				}
+				if result.Temperature != 45.0 {
+					t.Errorf("Temperature = %f, want 45.0", result.Temperature)
+				}
+				if result.MaxTemperature != 45.0 {
+					t.Errorf("MaxTemperature = %f, want 45.0", result.MaxTemperature)
+				}
+			},
+		},
+		{
+			name: "merge Status map",
+			base: &SMARTInfo{
+				N:      1,
+				Status: map[string]int{"healthy": 2},
+			},
+			other: &SMARTInfo{
+				N:      1,
+				Status: map[string]int{"healthy": 1, "warning": 1},
+			},
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.N != 2 {
+					t.Errorf("N = %d, want 2", result.N)
+				}
+				if result.Status["healthy"] != 3 {
+					t.Errorf("Status[healthy] = %d, want 3", result.Status["healthy"])
+				}
+				if result.Status["warning"] != 1 {
+					t.Errorf("Status[warning] = %d, want 1", result.Status["warning"])
+				}
+			},
+		},
+		{
+			name: "merge accumulated values and max tracking",
+			base: &SMARTInfo{
+				N:               1,
+				StatsN:          1,
+				Temperature:     40.0,
+				PowerOnHours:    1000,
+				PowerCycles:     100,
+				FailureRisk:     0.01,
+				MaxTemperature:  40.0,
+				MaxPowerOnHours: 1000,
+			},
+			other: &SMARTInfo{
+				N:               1,
+				StatsN:          1,
+				Temperature:     50.0,
+				PowerOnHours:    2000,
+				PowerCycles:     200,
+				FailureRisk:     0.02,
+				MaxTemperature:  55.0,
+				MaxPowerOnHours: 2000,
+			},
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.N != 2 {
+					t.Errorf("N = %d, want 2", result.N)
+				}
+				if result.StatsN != 2 {
+					t.Errorf("StatsN = %d, want 2", result.StatsN)
+				}
+				if result.Temperature != 90.0 {
+					t.Errorf("Temperature = %f, want 90.0", result.Temperature)
+				}
+				if result.PowerOnHours != 3000 {
+					t.Errorf("PowerOnHours = %f, want 3000", result.PowerOnHours)
+				}
+				if result.PowerCycles != 300 {
+					t.Errorf("PowerCycles = %d, want 300", result.PowerCycles)
+				}
+				if result.FailureRisk != 0.03 {
+					t.Errorf("FailureRisk = %f, want 0.03", result.FailureRisk)
+				}
+				if result.MaxTemperature != 55.0 {
+					t.Errorf("MaxTemperature = %f, want 55.0", result.MaxTemperature)
+				}
+				if result.MaxPowerOnHours != 2000 {
+					t.Errorf("MaxPowerOnHours = %f, want 2000", result.MaxPowerOnHours)
+				}
+			},
+		},
+		{
+			name: "merge with NVMe data",
+			base: &SMARTInfo{
+				N: 1,
+				NVMe: &SMARTNVMe{
+					N:              1,
+					AvailableSpare: 90,
+				},
+			},
+			other: &SMARTInfo{
+				N: 1,
+				NVMe: &SMARTNVMe{
+					N:              1,
+					AvailableSpare: 85,
+				},
+			},
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.N != 2 {
+					t.Errorf("N = %d, want 2", result.N)
+				}
+				if result.NVMe == nil {
+					t.Error("NVMe should not be nil")
+					return
+				}
+				if result.NVMe.N != 2 {
+					t.Errorf("NVMe.N = %d, want 2", result.NVMe.N)
+				}
+				if result.NVMe.AvailableSpare != 175 {
+					t.Errorf("NVMe.AvailableSpare = %d, want 175", result.NVMe.AvailableSpare)
+				}
+			},
+		},
+		{
+			name: "merge with SATA data",
+			base: &SMARTInfo{
+				N: 1,
+				SATA: &SMARTSATA{
+					N:                  1,
+					ReallocatedSectors: 5,
+				},
+			},
+			other: &SMARTInfo{
+				N: 1,
+				SATA: &SMARTSATA{
+					N:                  1,
+					ReallocatedSectors: 10,
+				},
+			},
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.N != 2 {
+					t.Errorf("N = %d, want 2", result.N)
+				}
+				if result.SATA == nil {
+					t.Error("SATA should not be nil")
+					return
+				}
+				if result.SATA.N != 2 {
+					t.Errorf("SATA.N = %d, want 2", result.SATA.N)
+				}
+				if result.SATA.ReallocatedSectors != 15 {
+					t.Errorf("SATA.ReallocatedSectors = %d, want 15", result.SATA.ReallocatedSectors)
+				}
+			},
+		},
+		{
+			name: "merge NVMe into empty base",
+			base: &SMARTInfo{N: 1},
+			other: &SMARTInfo{
+				N: 1,
+				NVMe: &SMARTNVMe{
+					N:              1,
+					AvailableSpare: 90,
+				},
+			},
+			verify: func(t *testing.T, result *SMARTInfo) {
+				if result.NVMe == nil {
+					t.Error("NVMe should not be nil")
+					return
+				}
+				if result.NVMe.N != 1 {
+					t.Errorf("NVMe.N = %d, want 1", result.NVMe.N)
+				}
+				if result.NVMe.AvailableSpare != 90 {
+					t.Errorf("NVMe.AvailableSpare = %d, want 90", result.NVMe.AvailableSpare)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+func TestHealingMetricsMergeActiveSessions(t *testing.T) {
+	now := time.Now()
+	sessionA := HealSession{
+		Bucket:    "bucket-a",
+		Status:    "running",
+		StartTime: now,
+	}
+	sessionB := HealSession{
+		Bucket:    "bucket-b",
+		Status:    "running",
+		StartTime: now,
+	}
+	sessionAUpdated := HealSession{
+		Bucket:    "bucket-a",
+		Status:    "done",
+		StartTime: now,
+		EndTime:   now.Add(time.Minute),
+	}
+
+	tests := []struct {
+		name   string
+		base   *HealingMetrics
+		other  *HealingMetrics
+		verify func(t *testing.T, result *HealingMetrics)
+	}{
+		{
+			name:  "nil other is no-op",
+			base:  &HealingMetrics{ActiveSessions: map[string]HealSession{"tok-a": sessionA}},
+			other: nil,
+			verify: func(t *testing.T, result *HealingMetrics) {
+				if len(result.ActiveSessions) != 1 {
+					t.Fatalf("ActiveSessions len = %d, want 1", len(result.ActiveSessions))
+				}
+			},
+		},
+		{
+			name: "other into nil base map",
+			base: &HealingMetrics{},
+			other: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{"tok-a": sessionA},
+			},
+			verify: func(t *testing.T, result *HealingMetrics) {
+				if len(result.ActiveSessions) != 1 {
+					t.Fatalf("ActiveSessions len = %d, want 1", len(result.ActiveSessions))
+				}
+				if result.ActiveSessions["tok-a"].Bucket != "bucket-a" {
+					t.Errorf("tok-a Bucket = %q, want bucket-a", result.ActiveSessions["tok-a"].Bucket)
+				}
+			},
+		},
+		{
+			name: "union of disjoint sessions",
+			base: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{"tok-a": sessionA},
+			},
+			other: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{"tok-b": sessionB},
+			},
+			verify: func(t *testing.T, result *HealingMetrics) {
+				if len(result.ActiveSessions) != 2 {
+					t.Fatalf("ActiveSessions len = %d, want 2", len(result.ActiveSessions))
+				}
+				if _, ok := result.ActiveSessions["tok-a"]; !ok {
+					t.Error("tok-a missing after merge")
+				}
+				if _, ok := result.ActiveSessions["tok-b"]; !ok {
+					t.Error("tok-b missing after merge")
+				}
+			},
+		},
+		{
+			name: "duplicate token overwrites with other",
+			base: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{"tok-a": sessionA},
+			},
+			other: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{"tok-a": sessionAUpdated},
+			},
+			verify: func(t *testing.T, result *HealingMetrics) {
+				if len(result.ActiveSessions) != 1 {
+					t.Fatalf("ActiveSessions len = %d, want 1", len(result.ActiveSessions))
+				}
+				if result.ActiveSessions["tok-a"].Status != "done" {
+					t.Errorf("tok-a Status = %q, want done", result.ActiveSessions["tok-a"].Status)
+				}
+			},
+		},
+		{
+			name: "both empty maps",
+			base: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{},
+			},
+			other: &HealingMetrics{
+				ActiveSessions: map[string]HealSession{},
+			},
+			verify: func(t *testing.T, result *HealingMetrics) {
+				if len(result.ActiveSessions) != 0 {
+					t.Errorf("ActiveSessions len = %d, want 0", len(result.ActiveSessions))
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+func TestKMSActionAdd(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   KMSAction
+		other  *KMSAction
+		verify func(t *testing.T, result KMSAction)
+	}{
+		{
+			name:  "nil other is no-op",
+			base:  KMSAction{Count: 5, AccTime: 1.0, MinTime: 0.1, MaxTime: 0.5},
+			other: nil,
+			verify: func(t *testing.T, r KMSAction) {
+				if r.Count != 5 {
+					t.Errorf("Count = %d, want 5", r.Count)
+				}
+			},
+		},
+		{
+			name:  "add to zero value",
+			base:  KMSAction{},
+			other: &KMSAction{Count: 3, AccTime: 0.9, MinTime: 0.2, MaxTime: 0.4, ConnFails: 1, RemoteErrs: 2},
+			verify: func(t *testing.T, r KMSAction) {
+				if r.Count != 3 {
+					t.Errorf("Count = %d, want 3", r.Count)
+				}
+				if r.MinTime != 0.2 {
+					t.Errorf("MinTime = %f, want 0.2", r.MinTime)
+				}
+				if r.ConnFails != 1 {
+					t.Errorf("ConnFails = %d, want 1", r.ConnFails)
+				}
+				if r.RemoteErrs != 2 {
+					t.Errorf("RemoteErrs = %d, want 2", r.RemoteErrs)
+				}
+			},
+		},
+		{
+			name:  "accumulate counts and errors",
+			base:  KMSAction{Count: 10, AccTime: 2.0, MinTime: 0.1, MaxTime: 0.5, ConnFails: 2, RemoteErrs: 1},
+			other: &KMSAction{Count: 5, AccTime: 1.5, MinTime: 0.05, MaxTime: 0.8, ConnFails: 1, RemoteErrs: 3},
+			verify: func(t *testing.T, r KMSAction) {
+				if r.Count != 15 {
+					t.Errorf("Count = %d, want 15", r.Count)
+				}
+				if r.AccTime != 3.5 {
+					t.Errorf("AccTime = %f, want 3.5", r.AccTime)
+				}
+				if r.MinTime != 0.05 {
+					t.Errorf("MinTime = %f, want 0.05", r.MinTime)
+				}
+				if r.MaxTime != 0.8 {
+					t.Errorf("MaxTime = %f, want 0.8", r.MaxTime)
+				}
+				if r.ConnFails != 3 {
+					t.Errorf("ConnFails = %d, want 3", r.ConnFails)
+				}
+				if r.RemoteErrs != 4 {
+					t.Errorf("RemoteErrs = %d, want 4", r.RemoteErrs)
+				}
+			},
+		},
+		{
+			name:  "min preserved when other is larger",
+			base:  KMSAction{Count: 1, MinTime: 0.01, MaxTime: 0.01},
+			other: &KMSAction{Count: 1, MinTime: 0.1, MaxTime: 0.1},
+			verify: func(t *testing.T, r KMSAction) {
+				if r.MinTime != 0.01 {
+					t.Errorf("MinTime = %f, want 0.01", r.MinTime)
+				}
+				if r.MaxTime != 0.1 {
+					t.Errorf("MaxTime = %f, want 0.1", r.MaxTime)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Add(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+func TestKMSActionAvg(t *testing.T) {
+	a := KMSAction{Count: 4, AccTime: 2.0}
+	if got := a.Avg(); got != 500*time.Millisecond {
+		t.Errorf("Avg() = %v, want 500ms", got)
+	}
+	zero := KMSAction{}
+	if got := zero.Avg(); got != 0 {
+		t.Errorf("Avg() on zero = %v, want 0", got)
+	}
+}
+
+func TestKMSRtMetricsMerge(t *testing.T) {
+	now := time.Now()
+	later := now.Add(time.Hour)
+
+	tests := []struct {
+		name   string
+		base   *KMSRtMetrics
+		other  *KMSRtMetrics
+		verify func(t *testing.T, result *KMSRtMetrics)
+	}{
+		{
+			name:  "nil other is no-op",
+			base:  &KMSRtMetrics{Nodes: 1, NodesOnline: 1, OnlineSecs: 60},
+			other: nil,
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.Nodes != 1 {
+					t.Errorf("Nodes = %d, want 1", r.Nodes)
+				}
+			},
+		},
+		{
+			name:  "accumulate nodes and active ops",
+			base:  &KMSRtMetrics{Nodes: 1, ActiveOps: 3},
+			other: &KMSRtMetrics{Nodes: 1, ActiveOps: 2},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", r.Nodes)
+				}
+				if r.ActiveOps != 5 {
+					t.Errorf("ActiveOps = %d, want 5", r.ActiveOps)
+				}
+			},
+		},
+		{
+			name:  "nodes online accumulates",
+			base:  &KMSRtMetrics{Nodes: 1, NodesOnline: 0},
+			other: &KMSRtMetrics{Nodes: 1, NodesOnline: 1},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.NodesOnline != 1 {
+					t.Errorf("NodesOnline = %d, want 1", r.NodesOnline)
+				}
+				if r.Nodes != 2 {
+					t.Errorf("Nodes = %d, want 2", r.Nodes)
+				}
+			},
+		},
+		{
+			name:  "online secs takes max",
+			base:  &KMSRtMetrics{OnlineSecs: 30},
+			other: &KMSRtMetrics{OnlineSecs: 120},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.OnlineSecs != 120 {
+					t.Errorf("OnlineSecs = %f, want 120", r.OnlineSecs)
+				}
+			},
+		},
+		{
+			name:  "last success takes latest",
+			base:  &KMSRtMetrics{LastSuccess: &now},
+			other: &KMSRtMetrics{LastSuccess: &later},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.LastSuccess == nil || !r.LastSuccess.Equal(later) {
+					t.Errorf("LastSuccess = %v, want %v", r.LastSuccess, later)
+				}
+			},
+		},
+		{
+			name:  "last success nil other preserved",
+			base:  &KMSRtMetrics{LastSuccess: &now},
+			other: &KMSRtMetrics{},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.LastSuccess == nil || !r.LastSuccess.Equal(now) {
+					t.Errorf("LastSuccess should be preserved")
+				}
+			},
+		},
+		{
+			name:  "collected at takes latest",
+			base:  &KMSRtMetrics{CollectedAt: now},
+			other: &KMSRtMetrics{CollectedAt: later},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if !r.CollectedAt.Equal(later) {
+					t.Errorf("CollectedAt = %v, want %v", r.CollectedAt, later)
+				}
+			},
+		},
+		{
+			name: "merge last minute maps",
+			base: &KMSRtMetrics{
+				LastMinute: map[string]KMSAction{
+					"Decrypt": {Count: 10, AccTime: 1.0, MinTime: 0.05, MaxTime: 0.2},
+				},
+			},
+			other: &KMSRtMetrics{
+				LastMinute: map[string]KMSAction{
+					"Decrypt":     {Count: 5, AccTime: 0.5, MinTime: 0.03, MaxTime: 0.3},
+					"GenerateKey": {Count: 2, AccTime: 0.1, MinTime: 0.04, MaxTime: 0.06},
+				},
+			},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if len(r.LastMinute) != 2 {
+					t.Fatalf("LastMinute len = %d, want 2", len(r.LastMinute))
+				}
+				dec := r.LastMinute["Decrypt"]
+				if dec.Count != 15 {
+					t.Errorf("Decrypt.Count = %d, want 15", dec.Count)
+				}
+				if dec.MinTime != 0.03 {
+					t.Errorf("Decrypt.MinTime = %f, want 0.03", dec.MinTime)
+				}
+				if dec.MaxTime != 0.3 {
+					t.Errorf("Decrypt.MaxTime = %f, want 0.3", dec.MaxTime)
+				}
+				gen := r.LastMinute["GenerateKey"]
+				if gen.Count != 2 {
+					t.Errorf("GenerateKey.Count = %d, want 2", gen.Count)
+				}
+			},
+		},
+		{
+			name:  "merge into nil base maps",
+			base:  &KMSRtMetrics{},
+			other: &KMSRtMetrics{LastMinute: map[string]KMSAction{"MAC": {Count: 1}}},
+			verify: func(t *testing.T, r *KMSRtMetrics) {
+				if r.LastMinute == nil || r.LastMinute["MAC"].Count != 1 {
+					t.Error("LastMinute should be populated from other")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.base.Merge(tt.other)
+			tt.verify(t, tt.base)
+		})
+	}
+}
+
+// Every MetricType bit and its value, pinned in one place.
+//
+// This is the only test that asserts MetricsAll. Per-section tests used to assert
+// it too, which meant a new bit broke every one of them for no reason -- adding a
+// type should touch exactly this table and nothing else.
+//
+// The values are wire values: a client asks for types by bit, and MetricsAll is
+// what the server uses when a client omits "types" entirely. Reordering the iota
+// block silently re-points every existing caller at a different section.
+func TestMetricTypeBitsAreStable(t *testing.T) {
+	want := []struct {
+		name string
+		got  MetricType
+		val  MetricType
+	}{
+		{"MetricsScanner", MetricsScanner, 1 << 0},
+		{"MetricsDisk", MetricsDisk, 1 << 1},
+		{"MetricsOS", MetricsOS, 1 << 2},
+		{"MetricsBatchJobs", MetricsBatchJobs, 1 << 3},
+		{"MetricsSiteResync", MetricsSiteResync, 1 << 4},
+		{"MetricNet", MetricNet, 1 << 5},
+		{"MetricsMem", MetricsMem, 1 << 6},
+		{"MetricsCPU", MetricsCPU, 1 << 7},
+		{"MetricsRPC", MetricsRPC, 1 << 8},
+		{"MetricsRuntime", MetricsRuntime, 1 << 9},
+		{"MetricsAPI", MetricsAPI, 1 << 10},
+		{"MetricsReplication", MetricsReplication, 1 << 11},
+		{"MetricsProcess", MetricsProcess, 1 << 12},
+		{"MetricsHealing", MetricsHealing, 1 << 13},
+		{"MetricsBuckets", MetricsBuckets, 1 << 14},
+		{"MetricsKMS", MetricsKMS, 1 << 15},
+		{"MetricsTablesAPI", MetricsTablesAPI, 1 << 16},
+		{"MetricsDistJobs", MetricsDistJobs, 1 << 17},
+		{"MetricsTargets", MetricsTargets, 1 << 18},
+		{"MetricsTier", MetricsTier, 1 << 19},
+		{"MetricsILM", MetricsILM, 1 << 20},
+		{"MetricsLocks", MetricsLocks, 1 << 21},
+		{"MetricsIAM", MetricsIAM, 1 << 22},
+	}
+
+	for _, w := range want {
+		if w.got != w.val {
+			t.Errorf("%s = %d, want %d: a MetricType was inserted or reordered, "+
+				"which re-points every existing caller at a different section",
+				w.name, w.got, w.val)
+		}
+	}
+
+	// MetricsAll must cover exactly the bits above and nothing more. A gap here
+	// means a bit was added without extending this table.
+	wantAll := want[len(want)-1].val<<1 - 1
+	if MetricsAll != int(wantAll) {
+		t.Errorf("MetricsAll = %d, want %d: append the new type to this table, and "+
+			"remember MetricsAll is the DEFAULT when a client omits types -- every "+
+			"new bit is on by default", MetricsAll, wantAll)
+	}
+
+	// String() is a hand-maintained addIf list, so a new bit is silently nameless
+	// if the line is forgotten.
+	for _, w := range want {
+		if got := w.got.String(); got == "" || got == "Unknown" {
+			t.Errorf("%s.String() = %q: add an addIf line in MetricType.String()", w.name, got)
+		}
+	}
+}

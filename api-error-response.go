@@ -62,7 +62,7 @@ func (e ErrorResponse) Error() string {
 }
 
 const (
-	reportIssue = "Please report this issue at https://github.com/minio/minio/issues."
+	reportIssue = "Please report this issue at https://github.com/lgcorzo/minio/issues."
 )
 
 // httpRespToErrorResponse returns a new encoded ErrorResponse
@@ -112,7 +112,7 @@ func httpRespToErrorResponse(resp *http.Response) error {
 //
 // For example:
 //
-//	import admin "github.com/minio/madmin-go/v4"
+//	import admin "github.com/lgcorzo/madmin-go/v4"
 //	...
 //	...
 //	ss, err := adm.ServiceStatus(...)
