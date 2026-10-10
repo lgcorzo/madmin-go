@@ -98,7 +98,7 @@ func (w *Writer) AddKeyEncrypted(publicKey *rsa.PublicKey) error {
 	}
 
 	// Write encrypted cipher key
-	w.setErr(mw.WriteBytes(cipherKey))
+	_ = w.setErr(mw.WriteBytes(cipherKey))
 	return w.sendBlock()
 }
 
@@ -138,7 +138,7 @@ func (w *Writer) AddKeyPlain() error {
 	w.key = &key
 
 	mw := w.addBlock(blockPlainKey)
-	w.setErr(mw.WriteBytes(key[:]))
+	_ = w.setErr(mw.WriteBytes(key[:]))
 
 	return w.sendBlock()
 }
@@ -151,7 +151,7 @@ func (w *Writer) AddError(msg string) error {
 		return w.err
 	}
 	mw := w.addBlock(blockError)
-	w.setErr(mw.WriteString(msg))
+	_ = w.setErr(mw.WriteString(msg))
 	return w.sendBlock()
 }
 
@@ -170,9 +170,9 @@ func (w *Writer) AddUnencryptedStream(name string, extra []byte) (io.WriteCloser
 	}
 
 	// Write metadata...
-	w.setErr(mw.WriteString(name))
-	w.setErr(mw.WriteBytes(extra))
-	w.setErr(mw.WriteUint8(uint8(w.checksum)))
+	_ = w.setErr(mw.WriteString(name))
+	_ = w.setErr(mw.WriteBytes(extra))
+	_ = w.setErr(mw.WriteUint8(uint8(w.checksum)))
 	if err := w.sendBlock(); err != nil {
 		return nil, err
 	}
@@ -208,9 +208,9 @@ func (w *Writer) AddEncryptedStream(name string, extra []byte) (io.WriteCloser, 
 	}
 
 	// Write metadata...
-	w.setErr(mw.WriteString(name))
-	w.setErr(mw.WriteBytes(extra))
-	w.setErr(mw.WriteUint8(uint8(w.checksum)))
+	_ = w.setErr(mw.WriteString(name))
+	_ = w.setErr(mw.WriteBytes(extra))
+	_ = w.setErr(mw.WriteUint8(uint8(w.checksum)))
 
 	stream, err := sio.AES_256_GCM.Stream(w.key[:])
 	if err != nil {
@@ -223,7 +223,7 @@ func (w *Writer) AddEncryptedStream(name string, extra []byte) (io.WriteCloser, 
 	w.nonce++
 
 	// Write nonce as bin array.
-	w.setErr(mw.WriteBytes(nonce))
+	_ = w.setErr(mw.WriteBytes(nonce))
 
 	if err := w.sendBlock(); err != nil {
 		return nil, err
@@ -240,7 +240,7 @@ func (w *Writer) AddEncryptedStream(name string, extra []byte) (io.WriteCloser, 
 		after = func() error {
 			err := encw.Close()
 			if err != nil {
-				sw.Close()
+				_ = sw.Close()
 				return err
 			}
 			return sw.Close()
@@ -330,7 +330,7 @@ func (w *streamWriter) Close() error {
 	if !w.eosWritten {
 		mw := w.w.addBlock(blockEOS)
 		sum := w.h.Sum(nil)
-		w.w.setErr(mw.WriteBytes(sum))
+		_ = w.w.setErr(mw.WriteBytes(sum))
 		w.eosWritten = true
 		return w.w.sendBlock()
 	}
