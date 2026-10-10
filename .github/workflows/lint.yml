@@ -12,6 +12,8 @@ on:
       - main
       - master
 
+permissions: read-all
+
 jobs:
   golangci-lint:
     name: golangci-lint Validation

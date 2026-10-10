@@ -10,6 +10,8 @@ on:
       - main
       - master
 
+permissions: read-all
+
 jobs:
   test:
     name: Testing Go ${{ matrix.go-version }} on ${{ matrix.os }}

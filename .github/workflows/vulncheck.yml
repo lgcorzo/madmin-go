@@ -8,6 +8,9 @@ on:
     branches:
       - master
       - main
+
+permissions: read-all
+
 jobs:
   vulncheck:
     name: Analysis

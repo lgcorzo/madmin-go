@@ -29,6 +29,7 @@ import (
 	"errors"
 	"hash"
 	"io"
+	"math"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/minio/minlz"
@@ -406,10 +407,10 @@ func (b *blockWriter) send() error {
 	}
 	// Add block id
 	hdr := msgp.AppendInt8(b.hdr[:0], int8(b.id))
-	blockLen := uint32(b.buf.Len())
-	if blockLen > (1<<32 - 1) {
+	if uint64(b.buf.Len()) > uint64(math.MaxUint32) {
 		return errors.New("max block size exceeded")
 	}
+	blockLen := uint32(b.buf.Len())
 	// Add block length.
 	hdr = msgp.AppendUint32(hdr, blockLen)
 	if _, err := b.w.Write(hdr); err != nil {

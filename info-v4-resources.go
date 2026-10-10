@@ -1139,7 +1139,7 @@ func (o *OptionalMetrics) AddFlags(f ...MetricFlags) {
 }
 
 func (o *OptionalMetrics) Parse(q url.Values) {
-	if t, err := strconv.ParseUint(q.Get("metric-types"), 10, 64); err == nil {
+	if t, err := strconv.ParseUint(q.Get("metric-types"), 10, 32); err == nil {
 		o.Types = MetricType(t)
 	}
 	if f, err := strconv.ParseUint(q.Get("metric-flags"), 10, 64); err == nil {
