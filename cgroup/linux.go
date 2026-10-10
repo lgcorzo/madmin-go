@@ -110,6 +110,7 @@ func parseProcCGroup(r io.Reader) (CGEntries, error) {
 // if cgroup manager is configured we should just rely on `cgm` cli
 // to fetch all the values for us.
 func getManagerKernValue(cname, path, kernParam string) (limit uint64, err error) {
+	// #nosec G204 -- cgm is a system command with internal parameters
 	cmd := exec.Command("cgm", "getvalue", cname, path, kernParam)
 	var out bytes.Buffer
 	cmd.Stdout = &out
