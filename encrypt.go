@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/secure-io/sio-go"
@@ -85,8 +86,11 @@ func EncryptData(password string, data []byte) ([]byte, error) {
 	nonce := sioutil.MustRandom(stream.NonceSize())
 
 	// ciphertext = salt || AEAD ID | nonce | encrypted data
-	cLen := int64(len(salt)+1+len(nonce)+len(data)) + stream.Overhead(int64(len(data)))
-	ciphertext := bytes.NewBuffer(make([]byte, 0, cLen)) // pre-alloc correct length
+	cLen := int64(len(salt)) + 1 + int64(len(nonce)) + int64(len(data)) + stream.Overhead(int64(len(data)))
+	if cLen > int64(math.MaxInt) {
+		return nil, errors.New("madmin: ciphertext buffer capacity exceeds maximum supported size")
+	}
+	ciphertext := bytes.NewBuffer(make([]byte, 0, int(cLen))) // pre-alloc correct length
 
 	// Prefix the ciphertext with salt, AEAD ID and nonce
 	ciphertext.Write(salt)
