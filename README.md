@@ -1,3 +1,5 @@
+Maintained fork of [minio/madmin-go](https://github.com/minio/madmin-go). It applies security patches and maintenance fixes on top of upstream. Part of the [Dark Gravity](https://github.com/lgcorzo/rust_CACD_autonomous_factory) factory. License: Apache-2.0.
+
 # lgcorzo/madmin-go
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -69,3 +71,10 @@ All documentation is available [here](https://pkg.go.dev/github.com/minio/madmin
 ## License
 
 This SDK is licensed under [GNU AGPLv3](https://github.com/minio/madmin-go/blob/master/LICENSE).
+
+---
+
+### Fork Maintenance & Agent Transparency
+
+- **Changes vs. Upstream:** Security dependency updates, CI/CD workflow fixes, and CodeQL remediation are tracked in the [commit history](https://github.com/lgcorzo/madmin-go/commits) and [Pull Requests](https://github.com/lgcorzo/madmin-go/pulls?q=is%3Apr).
+- **Agent Tagging (`[agent]`):** Commits and pull requests generated automatically by agents in the Dark Gravity pipeline are prefixed with `[agent]` to distinguish automated maintenance from manual work.
